@@ -1,0 +1,163 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // ---------- Helper ----------
+    function signedIn() { return request.auth != null; }
+    function profPath() { return /databases/$(database)/documents/users/$(request.auth.uid); }
+    function hasProfile() { return signedIn() && exists(profPath()); }
+    function prof() { return get(profPath()).data; }
+    function role() { return prof().role; }
+    function myEmp() { return prof().get('employeeId', ''); }
+    // PT yang boleh diakses akun ini (PT utama + akses tambahan). Owner (superuser) mengakses semua PT.
+    function cids() { return prof().get('companyIds', []); }
+    function isSuper() { return hasProfile() && role() == 'superuser'; }
+    function isHrd() { return hasProfile() && role() in ['staff_hrd', 'kepala_hrd', 'superuser']; }
+    function isMgmt() { return hasProfile() && role() in ['superuser', 'direktur', 'komisaris', 'kepala_hrd', 'staff_hrd']; }
+    function canWriteBalance() { return hasProfile() && role() in ['staff_hrd', 'kepala_hrd', 'direktur', 'superuser']; }
+    function bootstrapOpen() { return !exists(/databases/$(database)/documents/meta/bootstrap); }
+
+    // ---------- Setup pertama (membuat Superuser/owner pertama) ----------
+    match /meta/{id} {
+      allow read: if true; // dibutuhkan layar login untuk tahu apakah setup sudah dilakukan
+      allow create: if id == 'bootstrap' && signedIn() && bootstrapOpen()
+        && getAfter(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'superuser';
+      allow update, delete: if false;
+    }
+
+    // ---------- Peta username -> email (dibaca saat login) ----------
+    match /usernames/{u} {
+      allow read: if true;
+      allow create: if isHrd() || (signedIn() && bootstrapOpen());
+      allow update, delete: if isHrd();
+    }
+
+    // ---------- Perusahaan (PT) ----------
+    match /companies/{id} {
+      allow read: if isSuper() || (hasProfile() && id in cids());
+      allow create, update: if isSuper();
+      allow delete: if false;
+    }
+
+    // ---------- Profil akun ----------
+    match /users/{uid} {
+      allow read: if signedIn() && (request.auth.uid == uid
+        || isSuper()
+        || (isMgmt() && resource.data.companyId in cids()));
+
+      allow create: if (signedIn() && bootstrapOpen() && request.auth.uid == uid && request.resource.data.role == 'superuser')
+        || isSuper()
+        // Staff HRD: hanya Staff/Staff HRD, hanya di PT miliknya, dan tidak bisa memberi akses PT lain
+        || (hasProfile() && role() == 'staff_hrd'
+            && request.resource.data.role in ['staff', 'staff_hrd']
+            && request.resource.data.companyId in cids()
+            && request.resource.data.companyIds == [request.resource.data.companyId]);
+
+      allow update: if isSuper()
+        // pemilik hanya boleh mengganti foto
+        || (request.auth.uid == uid && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['photoUrl']))
+        // Staff HRD: ubah role antar Staff/Staff HRD di PT miliknya
+        || (hasProfile() && role() == 'staff_hrd' && request.auth.uid != uid
+            && resource.data.role in ['staff', 'staff_hrd'] && request.resource.data.role in ['staff', 'staff_hrd']
+            && resource.data.companyId in cids()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['role']))
+        // Direktur/Komisaris: hanya mengatur akses PT, dan hanya di antara PT miliknya sendiri
+        || (hasProfile() && role() in ['direktur', 'komisaris'] && request.auth.uid != uid
+            && resource.data.role != 'superuser'
+            && resource.data.companyId in cids()
+            && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['companyIds'])
+            && request.resource.data.companyIds.toSet().difference(resource.data.companyIds.toSet()).difference(cids().toSet()).size() == 0
+            && resource.data.companyIds.toSet().difference(request.resource.data.companyIds.toSet()).difference(cids().toSet()).size() == 0
+            && resource.data.companyId in request.resource.data.companyIds);
+
+      allow delete: if isSuper()
+        || (hasProfile() && role() == 'staff_hrd' && request.auth.uid != uid
+            && resource.data.role != 'superuser' && resource.data.companyId in cids());
+    }
+
+    // ---------- Penghitung nomor karyawan ----------
+    match /counters/{id} {
+      allow read: if isSuper() || (hasProfile() && role() == 'staff_hrd');
+      allow write: if (isSuper() || (hasProfile() && role() == 'staff_hrd'))
+        && (resource == null || request.resource.data.last > resource.data.last);
+    }
+
+    // ---------- Data karyawan & saldo ----------
+    match /employees/{id} {
+      allow read: if isSuper()
+        || (isMgmt() && resource.data.companyId in cids())
+        || (hasProfile() && myEmp() == id);
+      allow create: if isSuper()
+        || (hasProfile() && role() == 'staff_hrd' && request.resource.data.companyId in cids());
+      allow update: if isSuper()
+        || (canWriteBalance() && resource.data.companyId in cids() && request.resource.data.companyId == resource.data.companyId);
+      allow delete: if isSuper()
+        || (hasProfile() && role() == 'staff_hrd' && resource.data.companyId in cids());
+    }
+
+    // ---------- Buku mutasi saldo (hanya ditambah) ----------
+    match /ledger/{id} {
+      allow read: if isSuper()
+        || (isMgmt() && resource.data.companyId in cids())
+        || (hasProfile() && resource.data.employeeId == myEmp());
+      allow create: if isSuper() || (canWriteBalance() && request.resource.data.companyId in cids());
+      allow update: if false;
+      allow delete: if isSuper() || (isHrd() && resource.data.companyId in cids());
+    }
+
+    // ---------- Pengajuan cuti / izin ----------
+    match /requests/{id} {
+      allow read: if isSuper()
+        || (isMgmt() && resource.data.companyId in cids())
+        || (hasProfile() && resource.data.employeeId == myEmp());
+      allow create: if hasProfile()
+        && request.resource.data.employeeId == myEmp()
+        && request.resource.data.companyId == prof().companyId
+        && ((role() in ['staff', 'staff_hrd'] && request.resource.data.status == 'pending_review')
+            || (role() == 'kepala_hrd' && request.resource.data.status == 'pending_director'));
+      allow update: if hasProfile() && role() in ['staff_hrd', 'kepala_hrd', 'direktur']
+        && resource.data.employeeId != myEmp()
+        && resource.data.companyId in cids()
+        && request.resource.data.companyId == resource.data.companyId;
+      allow delete: if false;
+    }
+
+    // ---------- Penyesuaian saldo ----------
+    match /adjustments/{id} {
+      allow read: if isSuper() || (isMgmt() && resource.data.companyId in cids());
+      allow create: if hasProfile() && role() == 'staff_hrd'
+        && request.resource.data.status == 'pending_head'
+        && request.resource.data.employeeId != myEmp()
+        && request.resource.data.companyId in cids();
+      allow update: if hasProfile() && role() == 'kepala_hrd' && resource.data.companyId in cids();
+      allow delete: if false;
+    }
+
+    // ---------- Kalender libur ----------
+    // Kepala HRD mengajukan; Direktur menyetujui. Yang disetujui disalin ke calendar/holidays
+    // (dibaca saat menghitung cuti) sehingga tanggal merah tidak memotong jatah cuti.
+    match /holidays/{id} {
+      allow read: if hasProfile();
+      allow create: if hasProfile() && role() == 'kepala_hrd'
+        && request.resource.data.status == 'pending'
+        && request.resource.data.requestedByUid == request.auth.uid;
+      allow update: if hasProfile() && (
+        (role() == 'direktur' && (
+          (resource.data.status == 'pending' && request.resource.data.status in ['approved', 'rejected'])
+          || (resource.data.status == 'approved' && request.resource.data.status == 'revoked')))
+        || (role() == 'kepala_hrd' && resource.data.requestedByUid == request.auth.uid
+            && resource.data.status == 'pending' && request.resource.data.status == 'cancelled'));
+      allow delete: if false;
+    }
+    match /calendar/{id} {
+      allow read: if hasProfile();
+      allow write: if hasProfile() && role() == 'direktur' && id == 'holidays';
+    }
+
+    // ---------- Pengaturan (jatah cuti, carry over, dll.) ----------
+    match /settings/{id} {
+      allow read: if hasProfile();
+      allow write: if isSuper();
+    }
+  }
+}
