@@ -2,6 +2,13 @@
 import * as F from './firebase.js';
 import * as L from './logic.js';
 import * as C from './company.js';
+import * as K from './kinds.js';
+import * as W from './workcal.js';
+import * as R from './report.js';
+import { buildXlsx, STYLE } from './xlsx.js';
+import { buildPdf } from './pdf.js';
+
+const STATUS_APPROVED = 'approved';
 
 const { esc } = L;
 const { db, auth } = F;
@@ -10,7 +17,7 @@ const $$ = (s, r = document) => [...r.querySelectorAll(s)];
 const root = $('#root');
 const modalHost = $('#modalHost');
 
-const state = { user: null, emp: null, settings: { ...L.DEFAULT_SETTINGS }, route: null, busy: false, setupDone: true, reportMonth: '', companies: [], scope: 'all', holidays: [], holDocs: [], cal: { y: new Date().getFullYear(), m: new Date().getMonth(), sel: null } };
+const state = { user: null, emp: null, settings: { ...L.DEFAULT_SETTINGS }, route: null, busy: false, setupDone: true, reportMonth: '', companies: [], scope: 'all', holidays: [], batches: [], cal: { y: new Date().getFullYear(), m: new Date().getMonth(), drafts: {} }, photos: [], izinReqs: [], attMonth: '' };
 
 // ---------- Ikon & label ----------
 const ICONS = {
@@ -26,12 +33,14 @@ const ICONS = {
   approval: '<circle cx="12" cy="12" r="9"/><path d="M8 12.5l3 3 5-6"/>',
   companies: '<path d="M4 21V8l8-5 8 5v13M9 21v-6h6v6M8 11h.01M12 11h.01M16 11h.01"/>',
   holidays: '<rect x="3" y="5" width="18" height="16" rx="2"/><path d="M8 3v4M16 3v4M3 10h18M9 15l2 2 4-4"/>',
+  attendance: '<rect x="4" y="3" width="16" height="18" rx="2"/><path d="M8 8h8M8 12h8M8 16h5"/>',
+  newemp: '<circle cx="10" cy="8" r="3.5"/><path d="M3 20a7 7 0 0 1 14 0M19 8v6M16 11h6"/>',
   profile: '<circle cx="12" cy="8" r="4"/><path d="M4 21a8 8 0 0 1 16 0"/>',
 };
 const ico = (n) => `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">${ICONS[n] || ''}</svg>`;
 const NAV = {
   dashboard: 'Beranda', apply: 'Ajukan', review: 'Review', adjust: 'Penyesuaian', employees: 'Karyawan',
-  mutations: 'Mutasi', report: 'Laporan', settings: 'Pengaturan', accounts: 'Akun', approval: 'Persetujuan', profile: 'Profil', companies: 'Perusahaan', holidays: 'Libur',
+  mutations: 'Mutasi', report: 'Laporan', settings: 'Pengaturan', accounts: 'Akun', approval: 'Persetujuan', profile: 'Profil', companies: 'Perusahaan', holidays: 'Kalender Kerja', attendance: 'Absensi', newemp: 'Karyawan Baru',
 };
 
 // ---------- Format & komponen kecil ----------
@@ -68,6 +77,7 @@ function toast(msg, kind = '') {
 const errMsg = (e) => { console.error(e); return F.authErrorMessage(e); };
 
 function stepsHtml(r) {
+  if (r.auto) return '<div class="steps"><span class="step done"><i></i>Diajukan</span><span class="step done"><i></i>Disetujui otomatis</span></div>';
   const flow = r.employeeRole === 'kepala_hrd'
     ? [['pending_director', 'Direktur', 'direktur']]
     : [['pending_review', 'Review HRD', 'staff_hrd'], ['pending_head', 'Kepala HRD', 'kepala_hrd']];
@@ -161,14 +171,17 @@ async function loadHolidays() {
   try { const s = await F.getDoc(F.doc(db, 'calendar', 'holidays')); state.holidays = s.exists() ? (s.data().ranges || []) : []; }
   catch (e) { console.warn('holidays', e); state.holidays = []; }
 }
-const listHolidays = async () => snapList(await F.getDocs(F.collection(db, 'holidays'))).sort(byDateDesc('requestedAt'));
 // Hari yang akan dipotong untuk sebuah pengajuan, memperhitungkan tanggal merah yang berlaku sekarang.
-const effDays = (r) => (r.status === 'approved' || r.status === 'rejected' ? r.days
-  : C.countLeaveDays(r.startDate, r.endDate, { excludeWeekends: typeof r.excludeWeekends === 'boolean' ? r.excludeWeekends : !!state.settings.excludeWeekends, holidays: state.holidays }));
-function navItems(role) {
-  const base = L.navFor(role).filter((r) => r !== 'profile');
-  return [...(role === 'superuser' ? ['companies'] : []), ...base, 'holidays', 'profile'];
-}
+const effDays = (r) => (r.status === 'approved' || r.status === 'rejected' ? r.days : K.recountRequest(r, state.holidays, !!state.settings.excludeWeekends));
+const NAVS = {
+  superuser: ['companies', 'accounts', 'employees', 'mutations', 'report', 'attendance', 'settings', 'holidays', 'profile'],
+  staff: ['dashboard', 'apply', 'holidays', 'profile'],
+  staff_hrd: ['dashboard', 'apply', 'review', 'adjust', 'employees', 'newemp', 'attendance', 'holidays', 'profile'],
+  kepala_hrd: ['dashboard', 'apply', 'employees', 'newemp', 'attendance', 'holidays', 'profile'],
+  direktur: ['approval', 'newemp', 'employees', 'mutations', 'report', 'attendance', 'holidays', 'profile'],
+  komisaris: ['employees', 'mutations', 'report', 'holidays', 'profile'],
+};
+const navItems = (role) => NAVS[role] || ['profile'];
 function renderScope() {
   const el = $('#scopeBar'); if (!el) return;
   const ids = access();
@@ -297,7 +310,8 @@ async function loadSession(u) {
   await loadSettings();
   await loadCompanies();
   await loadHolidays();
-  state.scope = 'all';
+  state.scope = 'all'; state.attMonth = ''; state.photos = [];
+  state.cal = { y: new Date().getFullYear(), m: new Date().getMonth(), drafts: {} };
   if (state.user.role !== 'superuser' && !access().length) return renderNoCompany();
   state.route = null;
   renderShell();
@@ -381,10 +395,12 @@ async function updateCounts() {
     if (u.role === 'kepala_hrd') {
       c.dashboard = (await listAll('requests')).filter((r) => actOn(u, r) === 'head').length
         + (await listAll('adjustments')).filter((a) => a.status === 'pending_head').length;
+      c.newemp = (await listAll('employeeRequests')).filter((r) => empReqAction(u, r) || canCreateFrom(u, r)).length;
     }
     if (u.role === 'direktur') {
       c.approval = (await listAll('requests')).filter((r) => actOn(u, r) === 'director').length;
-      c.holidays = (await listHolidays()).filter((h) => h.status === 'pending').length;
+      c.holidays = (await listBatches()).filter((h) => h.status === 'pending').length;
+      c.newemp = (await listAll('employeeRequests')).filter((r) => empReqAction(u, r)).length;
     }
   } catch (e) { console.warn(e); }
   $$('[data-badge]').forEach((el) => { const n = c[el.dataset.badge] || 0; el.textContent = n; el.hidden = !n; });
@@ -431,8 +447,8 @@ function balanceHero(emp) {
 function myReqTable(list) {
   if (!list.length) return emptyHtml('Belum ada pengajuan', 'Pengajuan cuti dan izin Anda akan muncul di sini.');
   return `<div class="tw"><table><thead><tr><th>Periode</th><th>Hari</th><th>Jenis</th><th>Status</th></tr></thead><tbody>${list.map((r) => `<tr>
-    <td>${esc(fd(r.startDate))} – ${esc(fd(r.endDate))}</td><td>${r.days}</td>
-    <td>${esc(r.reason)}${r.rejectNote ? `<div class="sub">Alasan ditolak: ${esc(r.rejectNote)}</div>` : ''}</td>
+    <td>${esc(fd(r.startDate))} – ${esc(fd(r.endDate))}</td><td>${daysText(r)}</td>
+    <td>${esc(r.reason)}${r.rejectNote ? `<div class="sub">Alasan ditolak: ${esc(r.rejectNote)}</div>` : ''}${attBtn(r) ? `<div style="margin-top:6px">${attBtn(r)}</div>` : ''}</td>
     <td>${statusBadge(r.status)}${stepsHtml(r)}</td></tr>`).join('')}</tbody></table></div>`;
 }
 
@@ -451,7 +467,7 @@ function reqQueueItem(r, emps) {
   const yes = action === 'review' ? 'Teruskan' : 'Setujui';
   return `<div class="q-item ${debt ? 'debt' : ''}"><div class="q-main">
     <div class="who">${esc(r.employeeName)} <span class="badge b-role">${esc(roleLabel(r.employeeRole))}</span></div>
-    <div class="meta">${esc(fd(r.startDate))} – ${esc(fd(r.endDate))} · ${ed} hari${ed !== r.days ? ` (diajukan ${r.days}, tanggal merah tidak dihitung)` : ''} · ${esc(r.reason)}</div>
+    <div class="meta">${esc(fd(r.startDate))} – ${esc(fd(r.endDate))} · ${ed} hari${ed !== r.days ? ` (diajukan ${r.days}, tanggal merah tidak dihitung)` : ''} · ${esc(r.reason)}${izinBadge(r)}</div>${attBtn(r) ? `<div style="margin:6px 0">${attBtn(r)}</div>` : ''}
     <div class="proj">${r.deduct ? `Saldo ${b} hari → <b class="${debt ? 'num-neg' : 'num-pos'}">${debt ? 'hutang ' + Math.abs(proj) : 'sisa ' + proj}</b>` : 'Tidak memotong saldo'}</div>
     ${r.reviewedBy ? `<div class="meta">Direview oleh ${esc(r.reviewedBy)} · ${esc(fdt(r.reviewedAt))}</div>` : ''}
     ${stepsHtml(r)}</div>
@@ -466,7 +482,7 @@ function adjQueueItem(a) {
 function historyTable(list, emps) {
   if (!list.length) return emptyHtml('Belum ada riwayat');
   return `<div class="tw"><table><thead><tr><th>Nama</th><th>Periode</th><th>Hari</th><th>Jenis</th><th>Status</th><th>Diproses</th></tr></thead><tbody>${list.slice(0, 100).map((r) => `<tr>
-    <td><b>${esc(r.employeeName)}</b></td><td>${esc(fd(r.startDate))} – ${esc(fd(r.endDate))}</td><td>${r.days}</td><td>${esc(r.reason)}${r.rejectNote ? `<div class="sub">Ditolak: ${esc(r.rejectNote)}</div>` : ''}</td>
+    <td><b>${esc(r.employeeName)}</b></td><td>${esc(fd(r.startDate))} – ${esc(fd(r.endDate))}</td><td>${daysText(r)}</td><td>${esc(r.reason)}${izinBadge(r)}${r.rejectNote ? `<div class="sub">Ditolak: ${esc(r.rejectNote)}</div>` : ''}${attBtn(r) ? `<div style="margin-top:6px">${attBtn(r)}</div>` : ''}</td>
     <td>${statusBadge(r.status)}</td><td><span class="sub">${esc([r.reviewedBy, r.decidedBy].filter(Boolean).join(' → ') || '-')}</span></td></tr>`).join('')}</tbody></table></div>`;
 }
 const exportBtn = (act, label = 'Unduh CSV') => `<button class="btn btn-line btn-sm" data-act="${act}">${label}</button>`;
@@ -478,14 +494,18 @@ const afterPage = {};
 pages.dashboard = async () => {
   const u = state.user, emp = state.emp;
   let h = pageHead(`Halo, ${first(u.name)}`, 'Ringkasan cuti dan pengajuan Anda.', `<button class="btn btn-primary" data-act="go" data-route="apply">Ajukan cuti atau izin</button>`);
+  h += weddingHtml(await weddings());
   h += emp ? balanceHero(emp) : banner('warn', 'Akun belum terhubung ke data karyawan.', 'Hubungi Staff HRD.');
   if (u.role === 'staff_hrd') {
-    const n = (await listAll('requests')).filter((r) => actOn(u, r) === 'review').length;
+    const allReqs = await listAll('requests'); state.izinReqs = allReqs;
+    const n = allReqs.filter((r) => actOn(u, r) === 'review').length;
+    h += izinAlertCard(allReqs);
     if (n) h += `<div class="banner info"><div><strong>${n} pengajuan menunggu review Anda</strong><button class="btn btn-line btn-sm" style="margin-top:8px" data-act="go" data-route="review">Buka antrian review</button></div></div>`;
   }
   if (u.role === 'kepala_hrd') {
     const [reqs, adjs, emps] = await Promise.all([listAll('requests'), listAll('adjustments'), getEmployees()]);
-    const em = empMap(emps);
+    const em = empMap(emps); state.izinReqs = reqs;
+    h += izinAlertCard(reqs);
     const pr = reqs.filter((r) => actOn(u, r) === 'head').sort(byDateDesc('createdAt'));
     const pa = adjs.filter((a) => a.status === 'pending_head').sort(byDateDesc('requestedAt'));
     h += card(`Persetujuan cuti (${pr.length})`, pr.length ? pr.map((r) => reqQueueItem(r, em)).join('') : emptyHtml('Tidak ada yang menunggu', 'Semua pengajuan sudah diproses.'));
@@ -502,79 +522,178 @@ pages.dashboard = async () => {
   return h;
 };
 
+const izinWarn = () => (Number.isInteger(state.settings.izinWarn) && state.settings.izinWarn >= 2 ? state.settings.izinWarn : K.DEFAULT_IZIN_WARN);
+const MGMT_VIEW = ['staff_hrd', 'kepala_hrd', 'direktur'];
+const photoOk = (s) => /^data:image\/(jpeg|png);base64,[A-Za-z0-9+/=]+$/.test(String(s || ''));
+const attBtn = (r) => (r.attachmentIds && r.attachmentIds.length ? `<button class="btn btn-line btn-sm" data-act="att-view" data-id="${esc(r.id)}">Lampiran (${r.attachmentIds.length})</button>` : '');
+const daysText = (r, d = r.days) => (r.auto ? '-' : d);
+function izinBadge(r) {
+  if (!MGMT_VIEW.includes(state.user.role) || !K.isIzinCounted(r)) return '';
+  const n = K.izinCountFor(state.izinReqs, r.employeeId, K.monthKey(r.startDate));
+  return n >= izinWarn() ? ` <span class="badge b-warn" title="Izin berulang dalam sebulan">${n}x izin bulan ini</span>` : '';
+}
+function izinAlertCard(reqs) {
+  const al = K.izinAlerts(reqs, K.monthKey(L.toISODate(new Date())), izinWarn());
+  if (!al.length) return '';
+  return card('Perhatian: izin terlalu sering bulan ini', `<p class="sub" style="margin-bottom:10px">Karyawan dengan ${izinWarn()}x izin atau lebih (sakit, keluarga sakit, izin lainnya) dalam bulan berjalan.</p>`
+    + al.map((a) => `<div class="q-item debt"><div class="q-main"><div class="who">${esc(a.name)} <span class="badge b-warn">${a.count}x izin</span></div>
+      <div class="meta">${a.items.slice().sort((x, y) => (x.startDate < y.startDate ? -1 : 1)).map((i) => `${esc(fd(i.startDate))} (${esc((K.kindById(i.kind) || {}).label || i.reasonType)})`).join(' · ')}</div></div></div>`).join(''));
+}
+async function weddings() {
+  try { const t = L.toISODate(new Date()); return (await listAll('announcements')).filter((a) => a.type === 'wedding' && a.endDate >= t).sort(byDateDesc('createdAt')); }
+  catch (e) { console.warn('announcements', e); return []; }
+}
+const weddingHtml = (list) => list.map((a) => `<section class="wed" role="note"><div class="wed-t">Selamat atas pernikahan <b>${esc(a.employeeName)}</b></div>
+  <div class="wed-s">Semoga bahagia selalu. Cuti pernikahan ${esc(fd(a.startDate))} – ${esc(fd(a.endDate))}${state.companies.length > 1 ? ' · ' + esc(coName(a.companyId)) : ''}</div>
+  ${photoOk(a.photo) ? `<img class="wed-img" src="${esc(a.photo)}" alt="Undangan pernikahan ${esc(a.employeeName)}">` : ''}</section>`).join('');
+
 pages.apply = async () => {
   const u = state.user, emp = state.emp;
   if (!emp) return pageHead('Ajukan cuti') + banner('warn', 'Akun belum terhubung ke data karyawan.', 'Hubungi Staff HRD.');
-  const cats = ['Cuti', 'Sakit', 'Khusus', 'Izin', 'Lainnya'];
-  const opts = cats.map((c) => `<optgroup label="${esc(c)}">${L.LEAVE_TYPES.filter((t) => t.category === c).map((t) => `<option value="${esc(t.id)}">${esc(t.id)}</option>`).join('')}</optgroup>`).join('');
+  state.photos = [];
+  const opts = K.GROUPS.map((g) => `<optgroup label="${esc(g.label)}">${K.kindsOf(g.id).map((k) => `<option value="${esc(k.id)}">${esc(k.label)}</option>`).join('')}</optgroup>`).join('');
   const flow = u.role === 'kepala_hrd' ? 'Anda → persetujuan Direktur' : u.role === 'staff_hrd' ? 'Anda → review Staff HRD lain → persetujuan Kepala HRD' : 'Anda → review Staff HRD → persetujuan Kepala HRD';
   const mine = await myRequests();
-  let h = pageHead('Ajukan cuti atau izin', `Alur: ${flow}`);
+  let h = pageHead('Ajukan cuti atau izin', `Alur: ${flow}. Datang/pulang terlambat disetujui otomatis.`);
   if (bal(emp) < 0) h += banner('danger', `Anda punya hutang cuti ${Math.abs(bal(emp))} hari.`, 'Cuti yang memotong saldo akan menambah hutang.');
-  if (!L.isEligible(emp.joinDate)) h += banner('info', 'Masa kerja Anda belum genap 1 tahun.', 'Cuti tahunan yang diajukan sekarang akan tercatat sebagai hutang.');
-  h += banner('info', '', `${L.lockMessage(new Date(), state.settings.lockDay)} Sisa cuti Anda saat ini ${bal(emp)} hari.`);
+  if (!L.isEligible(emp.joinDate)) h += banner('info', 'Masa kerja Anda belum genap 1 tahun.', 'Cuti yang diajukan sekarang akan tercatat sebagai hutang.');
+  h += banner('info', '', `${L.lockMessage(new Date(), state.settings.lockDay)} Sisa cuti Anda saat ini ${bal(emp)} hari. Sabtu, Minggu, dan tanggal merah tidak dihitung.`);
   h += `<section class="card"><form data-submit="leave" novalidate>
-    <div class="field"><label for="lvType">Jenis</label><select id="lvType" data-input="calc"><option value="">Pilih jenis cuti atau izin</option>${opts}</select><div class="hint" id="lvTypeHint"></div></div>
-    <div class="row2"><div class="field"><label for="lvStart">Mulai</label><input type="date" id="lvStart" data-input="calc"></div>
-    <div class="field"><label for="lvEnd">Selesai</label><input type="date" id="lvEnd" data-input="calc"></div></div>
+    <div class="field"><label for="lvType">Jenis pengajuan</label><select id="lvType" data-input="calc"><option value="">Pilih jenis pengajuan</option>${opts}</select><div class="hint" id="lvTypeHint"></div></div>
+    <div class="field" id="lvFamilyWrap" hidden><label for="lvFamily">Hubungan keluarga</label><select id="lvFamily" data-input="calc"><option value="">Pilih keluarga</option>${K.FAMILY.map((f) => `<option>${esc(f)}</option>`).join('')}</select></div>
+    <div class="row2"><div class="field"><label for="lvStart" id="lvStartLabel">Mulai</label><input type="date" id="lvStart" data-input="calc"></div>
+    <div class="field" id="lvEndWrap"><label for="lvEnd">Selesai</label><input type="date" id="lvEnd" data-input="calc"></div></div>
     <div class="field"><label for="lvDetail" id="lvDetailLabel">Keterangan (opsional)</label><textarea id="lvDetail" data-input="calc" maxlength="300"></textarea></div>
+    <div class="field" id="lvPhotoWrap" hidden><label id="lvPhotoLabel">Lampiran foto</label><div class="photos" id="lvPhotos"></div>
+      <button type="button" class="btn btn-line btn-sm" data-act="lv-photo" id="lvPhotoBtn">Tambah foto</button>
+      <input type="file" id="lvPhotoInput" data-input="lv-photo-file" accept="image/*" multiple hidden>
+      <div class="hint">Hanya foto (JPG/PNG), diperkecil otomatis. Maksimal ${K.MAX_PHOTOS} foto.</div></div>
     <div class="calc" id="lvCalc" hidden></div>
     <button class="btn btn-primary" id="lvBtn" type="submit">Kirim pengajuan</button></form></section>`;
   h += card('Riwayat pengajuan saya', myReqTable(mine));
   return h;
 };
 
+function renderPhotos() {
+  const el = $('#lvPhotos'); if (!el) return;
+  el.innerHTML = state.photos.map((p, i) => `<div class="ph"><img src="${esc(p.data)}" alt="Foto ${i + 1}"><button type="button" class="ph-x" data-act="lv-photo-del" data-i="${i}" aria-label="Hapus foto ${i + 1}">×</button></div>`).join('');
+  const b = $('#lvPhotoBtn'); if (b) b.hidden = state.photos.length >= K.MAX_PHOTOS;
+}
+
+function compressPhoto(file, maxSide = 1280, maxBytes = 230000) {
+  return new Promise((res, rej) => {
+    const img = new Image(), url = URL.createObjectURL(file);
+    img.onload = () => {
+      URL.revokeObjectURL(url);
+      let k = Math.min(1, maxSide / Math.max(img.width, img.height)), q = 0.72, out = '';
+      for (let i = 0; i < 10; i++) {
+        const c = document.createElement('canvas');
+        c.width = Math.max(1, Math.round(img.width * k)); c.height = Math.max(1, Math.round(img.height * k));
+        const ctx = c.getContext('2d'); ctx.fillStyle = '#fff'; ctx.fillRect(0, 0, c.width, c.height); ctx.drawImage(img, 0, 0, c.width, c.height);
+        out = c.toDataURL('image/jpeg', q);
+        if (out.length * 0.75 <= maxBytes) return res(out);
+        if (q > 0.5) q -= 0.1; else k *= 0.8;
+      }
+      rej(new Error('Foto terlalu besar, coba foto lain.'));
+    };
+    img.onerror = () => { URL.revokeObjectURL(url); rej(new Error('File bukan gambar yang valid.')); };
+    img.src = url;
+  });
+}
+async function addPhotos(el) {
+  const files = [...el.files]; el.value = '';
+  if (!files.length) return;
+  for (const f of files) {
+    if (state.photos.length >= K.MAX_PHOTOS) { toast(`Maksimal ${K.MAX_PHOTOS} foto.`, 'err'); break; }
+    if (!/^image\//.test(f.type)) { toast('Hanya file foto yang diterima.', 'err'); continue; }
+    try { state.photos.push({ name: f.name.slice(0, 60), data: await compressPhoto(f) }); } catch (e) { toast(errMsg(e), 'err'); }
+  }
+  renderPhotos(); updateCalc();
+}
+
 function updateCalc() {
-  const s = $('#lvStart').value, e = $('#lvEnd').value, type = $('#lvType').value, box = $('#lvCalc');
-  const t = L.leaveTypeById(type);
-  $('#lvTypeHint').textContent = t ? (t.deduct ? 'Memotong saldo cuti tahunan.' : 'Tidak memotong saldo cuti tahunan.') : '';
-  $('#lvDetailLabel').textContent = t && t.needsDetail ? 'Keterangan (wajib)' : 'Keterangan (opsional)';
-  if (!s || !e || L.validateRange(s, e) || !t) { box.hidden = true; return; }
-  const co = { excludeWeekends: state.settings.excludeWeekends, holidays: state.holidays };
-  const days = C.countLeaveDays(s, e, co), freed = C.holidayDaysIn(s, e, co);
-  const b = bal(state.emp), proj = L.projectBalance(b, days, t.deduct), debt = proj < 0;
-  box.hidden = false; box.className = 'calc' + (debt ? ' debt' : '');
-  if (!days) { box.innerHTML = '<div class="r"><span>Rentang ini hanya berisi akhir pekan atau tanggal merah, tidak ada hari yang dihitung.</span></div>'; return; }
-  box.innerHTML = `<div class="r"><span>Durasi</span><b>${days} hari${state.settings.excludeWeekends ? ' kerja' : ''}</b></div>
-    ${freed ? `<div class="r"><span>Tanggal merah (tidak dipotong)</span><b>${freed} hari</b></div>` : ''}
-    <div class="r"><span>Saldo sekarang</span><b>${b} hari</b></div>
-    <div class="r t"><span>Saldo setelah disetujui</span><b class="${debt ? 'num-neg' : ''}">${proj} hari${debt ? ' (hutang)' : ''}</b></div>`;
+  const kind = K.kindById($('#lvType').value), box = $('#lvCalc');
+  const single = !!(kind && kind.single);
+  $('#lvEndWrap').hidden = single;
+  $('#lvStartLabel').textContent = single ? 'Tanggal' : 'Mulai';
+  const s = $('#lvStart').value, e = single ? s : $('#lvEnd').value;
+  $('#lvTypeHint').textContent = kind ? (kind.hint || (kind.deduct ? 'Memotong saldo cuti tahunan.' : 'Tidak memotong saldo cuti tahunan.')) : '';
+  $('#lvFamilyWrap').hidden = !(kind && kind.family);
+  const min = kind && kind.detail ? kind.detail.min : 0;
+  $('#lvDetailLabel').textContent = min ? `Keterangan (wajib, minimal ${min} karakter)` : 'Keterangan (opsional)';
+  const ok = kind && s && e && !L.validateRange(s, e);
+  const days = ok ? K.countDays(kind, s, e, state.holidays) : 0;
+  const rule = kind ? K.docRule(kind, days) : null;
+  $('#lvPhotoWrap').hidden = !(kind && kind.docs);
+  if (kind && kind.docs) $('#lvPhotoLabel').textContent = kind.docs.always ? `Lampiran foto ${kind.docs.label} (wajib)` : rule && rule.required ? `Lampiran foto ${kind.docs.label} (wajib karena lebih dari ${kind.docs.overDays} hari)` : `Lampiran foto ${kind.docs.label} (wajib bila lebih dari ${kind.docs.overDays} hari)`;
+  if (!ok) { box.hidden = true; return; }
+  box.hidden = false;
+  const msg = (t) => { box.className = 'calc debt'; box.innerHTML = `<div class="r"><span>${esc(t)}</span></div>`; };
+  if (!days) return msg(kind.calendar ? 'Pilih rentang tanggal.' : 'Tanggal ini jatuh pada akhir pekan atau tanggal merah, tidak ada hari kerja yang dihitung.');
+  if (kind.maxDays && days > kind.maxDays) return msg(`${kind.label} maksimal ${kind.maxDays} hari${kind.calendar ? ' kalender' : ' kerja'}. Rentang ini ${days} hari.`);
+  const freed = kind.calendar ? 0 : C.holidayDaysIn(s, e, { excludeWeekends: true, holidays: state.holidays });
+  const b = bal(state.emp), proj = L.projectBalance(b, days, kind.deduct), debt = proj < 0;
+  box.className = 'calc' + (debt ? ' debt' : '');
+  box.innerHTML = kind.auto ? '<div class="r"><span>Disetujui otomatis dan tercatat di riwayat pengajuan.</span></div>'
+    : `<div class="r"><span>Durasi</span><b>${days} hari${kind.calendar ? ' kalender' : ' kerja'}</b></div>
+    ${freed ? `<div class="r"><span>Tanggal merah (tidak dihitung)</span><b>${freed} hari</b></div>` : ''}
+    ${kind.deduct ? `<div class="r"><span>Saldo sekarang</span><b>${b} hari</b></div><div class="r t"><span>Saldo setelah disetujui</span><b class="${debt ? 'num-neg' : ''}">${proj} hari${debt ? ' (hutang)' : ''}</b></div>` : '<div class="r t"><span>Tidak memotong saldo cuti</span><b></b></div>'}`;
 }
 
 async function submitLeave() {
   const u = state.user, emp = state.emp;
-  const s = $('#lvStart').value, e = $('#lvEnd').value, type = $('#lvType').value, detail = $('#lvDetail').value.trim();
-  const t = L.leaveTypeById(type);
-  if (!t) return toast('Pilih jenis cuti atau izin.', 'err');
+  const kind = K.kindById($('#lvType').value);
+  if (!kind) return toast('Pilih jenis pengajuan.', 'err');
+  const s = $('#lvStart').value, e = kind.single ? s : $('#lvEnd').value, detail = $('#lvDetail').value.trim(), family = kind.family ? $('#lvFamily').value : '';
   const ve = L.validateRange(s, e); if (ve) return toast(ve, 'err');
-  if (t.needsDetail && detail.length < 5) return toast('Keterangan wajib diisi (minimal 5 karakter).', 'err');
   if (L.isDateLocked(s, new Date(), state.settings.lockDay)) return toast(L.lockMessage(new Date(), state.settings.lockDay), 'err');
   await loadHolidays();
-  const days = C.countLeaveDays(s, e, { excludeWeekends: state.settings.excludeWeekends, holidays: state.holidays });
-  if (days < 1) return toast('Rentang hanya berisi akhir pekan atau tanggal merah.', 'err');
-  const status = L.initialStatus(u.role); if (!status) return toast('Role Anda tidak bisa mengajukan cuti.', 'err');
+  const days = K.countDays(kind, s, e, state.holidays);
+  const photos = kind.docs ? state.photos.slice(0, K.MAX_PHOTOS) : [];
+  const err = K.validateRequest({ kind, start: s, end: e, detail, family, days, nPhotos: photos.length });
+  if (err) return toast(err, 'err');
+  const status = kind.auto ? STATUS_APPROVED : L.initialStatus(u.role); if (!status) return toast('Role Anda tidak bisa mengajukan cuti.', 'err');
+  bust();
   const mine = await myRequests();
-  const clash = mine.find((r) => r.status !== 'rejected' && L.rangesOverlap(s, e, r.startDate, r.endDate));
+  if (kind.late && K.lateCount(mine, emp.id, kind.id, s) >= K.MONTHLY_LATE_CAP) return toast(`${kind.label} hanya boleh ${K.MONTHLY_LATE_CAP}x dalam 1 bulan. Bulan ini sudah ${K.MONTHLY_LATE_CAP}x.`, 'err');
+  const clash = mine.find((r) => r.status !== 'rejected' && L.rangesOverlap(s, e, r.startDate, r.endDate) && !(kind.late && r.kind && r.kind !== kind.id && (K.kindById(r.kind) || {}).late));
   if (clash) return toast(`Tanggal bertabrakan dengan pengajuan ${fd(clash.startDate)} – ${fd(clash.endDate)}.`, 'err');
-  if (t.deduct && bal(emp) - days < 0) {
+  if (kind.deduct && bal(emp) - days < 0) {
     const ok = await confirmBox('Saldo tidak cukup', `Saldo ${bal(emp)} hari, cuti ${days} hari. Selisih ${Math.abs(bal(emp) - days)} hari akan menjadi hutang dan dipotong dari jatah tahun berikutnya. Lanjutkan?`, 'Ajukan tetap', true);
     if (!ok) return;
   }
   const btn = $('#lvBtn'); btn.disabled = true;
   try {
-    await F.addDoc(F.collection(db, 'requests'), {
-      employeeId: emp.id, employeeName: emp.name, employeeRole: u.role,
-      reasonType: type, reasonDetail: detail, reason: t.needsDetail ? `Lainnya: ${detail}` : detail ? `${type} — ${detail}` : type,
-      startDate: s, endDate: e, days, deduct: t.deduct, excludeWeekends: !!state.settings.excludeWeekends, companyId: emp.companyId, status, createdAt: new Date().toISOString(),
+    const now = new Date().toISOString(), rref = F.doc(F.collection(db, 'requests')), b = F.writeBatch(db);
+    const attachmentIds = photos.map((p) => {
+      const ref = F.doc(F.collection(db, 'attachments'));
+      b.set(ref, { requestId: rref.id, employeeId: emp.id, companyId: emp.companyId, name: p.name, data: p.data, createdAt: now });
+      return ref.id;
     });
-    bust(); toast('Pengajuan terkirim.', 'ok'); go('apply');
-  } catch (err) { toast(errMsg(err), 'err'); btn.disabled = false; }
+    const doc = {
+      employeeId: emp.id, employeeName: emp.name, employeeRole: u.role, companyId: emp.companyId,
+      kind: kind.id, group: kind.group, reasonType: kind.label, reasonDetail: detail, family, reason: K.reasonText(kind, detail, family),
+      startDate: s, endDate: e, days: kind.auto ? 0 : days, deduct: kind.deduct, countMode: K.countModeOf(kind), attachmentIds, status, createdAt: now,
+    };
+    if (kind.auto) Object.assign(doc, { auto: true, daysSubmitted: days, decidedBy: 'Otomatis', decidedRole: 'system', decidedAt: now });
+    b.set(rref, doc);
+    await b.commit();
+    bust(); toast(kind.auto ? 'Tercatat dan disetujui otomatis.' : 'Pengajuan terkirim.', 'ok'); go('apply');
+  } catch (er) { toast(errMsg(er), 'err'); btn.disabled = false; }
+}
+
+async function viewAttachments(id) {
+  const r = (await getRequests()).find((x) => x.id === id);
+  if (!r || !(r.attachmentIds || []).length) return;
+  const docs = await Promise.all(r.attachmentIds.map((a) => F.getDoc(F.doc(db, 'attachments', a)).catch(() => null)));
+  const imgs = docs.filter((d) => d && d.exists() && photoOk(d.data().data)).map((d, i) => `<img class="att-img" src="${esc(d.data().data)}" alt="Lampiran ${i + 1}">`);
+  await info(`Lampiran - ${r.employeeName}`, imgs.length ? imgs.join('') : '<p>Lampiran tidak dapat dibuka.</p>');
 }
 
 pages.review = async () => {
   const u = state.user;
   const [reqs, emps] = await Promise.all([listAll('requests'), getEmployees()]);
-  const em = empMap(emps);
+  const em = empMap(emps); state.izinReqs = reqs;
   const pend = reqs.filter((r) => actOn(u, r) === 'review').sort(byDateDesc('createdAt'));
   const done = reqs.filter((r) => r.status !== 'pending_review').sort(byDateDesc('createdAt'));
   return pageHead('Review pengajuan', 'Siapa pun Staff HRD yang memproses lebih dulu yang tercatat. Ajuan Anda sendiri tidak muncul di sini.')
@@ -585,10 +704,11 @@ pages.review = async () => {
 pages.approval = async () => {
   const u = state.user;
   const [reqs, emps] = await Promise.all([listAll('requests'), getEmployees()]);
-  const em = empMap(emps);
+  const em = empMap(emps); state.izinReqs = reqs;
   const pend = reqs.filter((r) => actOn(u, r) === 'director').sort(byDateDesc('createdAt'));
   const done = reqs.filter((r) => r.employeeRole === 'kepala_hrd' && !L.isPending(r.status)).sort(byDateDesc('decidedAt'));
   return pageHead('Persetujuan Direktur', 'Alur: Kepala HRD → Direktur (satu langkah).')
+    + weddingHtml(await weddings()) + izinAlertCard(reqs)
     + card(`Menunggu persetujuan (${pend.length})`, pend.length ? pend.map((r) => reqQueueItem(r, em)).join('') : emptyHtml('Tidak ada pengajuan', 'Semua sudah diproses.'))
     + card('Riwayat keputusan', historyTable(done, em), exportBtn('export-requests'));
 };
@@ -603,13 +723,17 @@ async function processRequest(id, approve, note) {
     if (!action) throw new Error('Pengajuan ini sudah diproses atau bukan wewenang Anda.');
     const now = new Date().toISOString();
     const patch = L.decisionPatch(action, approve, state.user, now, note);
-    let eref = null, emp = null, days = req.days, freed = 0;
+    let eref = null, emp = null, days = req.days, freed = 0, wedding = null;
     if (patch.status === 'approved') {
       // Hitung ulang dengan tanggal merah yang berlaku saat ini: tanggal merah tidak memotong jatah cuti.
       const cs = await tx.get(cref);
       const holidays = cs.exists() ? cs.data().ranges || [] : [];
-      const ew = typeof req.excludeWeekends === 'boolean' ? req.excludeWeekends : !!state.settings.excludeWeekends;
-      days = C.countLeaveDays(req.startDate, req.endDate, { excludeWeekends: ew, holidays });
+      days = K.recountRequest(req, holidays, !!state.settings.excludeWeekends);
+      const kd = K.kindById(req.kind);
+      if (kd && kd.announce === 'wedding' && (req.attachmentIds || [])[0]) {
+        const as = await tx.get(F.doc(db, 'attachments', req.attachmentIds[0]));
+        wedding = { photo: as.exists() ? as.data().data : '' };
+      }
       freed = Math.max(0, req.days - days);
       if (days !== req.days) { patch.days = days; patch.daysSubmitted = req.days; }
       if (req.deduct && days > 0) {
@@ -620,6 +744,7 @@ async function processRequest(id, approve, note) {
       }
     }
     tx.update(rref, patch);
+    if (wedding) tx.set(F.doc(db, 'announcements', id), { type: 'wedding', requestId: id, companyId: req.companyId, employeeId: req.employeeId, employeeName: req.employeeName, startDate: req.startDate, endDate: req.endDate, photo: wedding.photo, approvedBy: state.user.name, createdAt: now });
     if (eref) {
       const nb = bal(emp) - days;
       tx.update(eref, { leaveBalance: nb });
@@ -731,7 +856,8 @@ pages.employees = async () => {
       ${canRole ? `<button class="btn btn-line btn-sm" data-act="emp-role" data-id="${esc(e.id)}">Ubah role</button>` : ''}
       ${manage && usr && usr.role !== 'superuser' && usr.employeeId !== u.employeeId ? `<button class="btn btn-ghost btn-sm" data-act="emp-del" data-id="${esc(e.id)}">Hapus</button>` : ''}</div></td></tr>`;
   }).join('');
-  return pageHead('Karyawan', `${emps.length} karyawan terdaftar.`, u.role === 'staff_hrd' ? '<button class="btn btn-primary" data-act="add-staff">Tambah karyawan</button>' : '')
+  return pageHead('Karyawan', `${emps.length} karyawan terdaftar.`, u.role === 'staff_hrd' || u.role === 'kepala_hrd' ? '<button class="btn btn-primary" data-act="go" data-route="newemp">Ajukan karyawan baru</button>' : '')
+    + (['komisaris', 'superuser'].includes(u.role) ? weddingHtml(await weddings()) : '')
     + `<section class="card"><div class="toolbar"><input type="text" id="empSearch" data-input="search" data-target="#empBody" data-counter="#empCount" placeholder="Cari nama atau ID" aria-label="Cari karyawan"><span class="count" id="empCount">${emps.length} karyawan</span></div>
     <div class="tw"><table><thead><tr><th>ID</th><th>Nama</th><th>PT</th><th>Bergabung</th><th>Saldo cuti</th><th></th></tr></thead><tbody id="empBody">${rows || ''}</tbody></table></div></section>`;
 };
@@ -765,32 +891,49 @@ async function allocEmployeeId() {
   });
 }
 
-async function createAccount({ name, username, role, joinDate, password, companyId, companyIds }) {
-  if (!state.companies.some((c) => c.id === companyId) || !access().includes(companyId)) throw new Error('PT tidak valid atau di luar akses Anda.');
+async function createAccount({ name, username, role, joinDate, password, companyId, companyIds, employeeRequestId }) {
+  const isSuper = role === 'superuser';
+  if (isSuper && state.user.role !== 'superuser') throw new Error('Hanya Superuser yang bisa menambah Superuser.');
+  if (!isSuper && (!state.companies.some((c) => c.id === companyId) || !access().includes(companyId))) throw new Error('PT tidak valid atau di luar akses Anda.');
   if ((await F.getDoc(F.doc(db, 'usernames', username))).exists()) throw new Error('Username sudah dipakai.');
-  const nid = await allocEmployeeId();
+  if (employeeRequestId) {
+    const rs = await F.getDoc(F.doc(db, 'employeeRequests', employeeRequestId));
+    if (!rs.exists() || rs.data().status !== 'approved') throw new Error('Pengajuan karyawan ini belum disetujui atau sudah dibuatkan akun.');
+  }
+  const nid = isSuper ? null : await allocEmployeeId();
   let email = L.loginIdToEmail(username), uid;
   try { uid = await F.createAuthUser(email, password); } catch (e) {
     if (e.code !== 'auth/email-already-in-use') throw e; // login lama (karyawan yang sudah dihapus) masih tercatat di Firebase Auth
     email = `${username}.${Math.random().toString(36).slice(2, 7)}@${L.LOGIN_DOMAIN}`;
     uid = await F.createAuthUser(email, password);
   }
-  const now = new Date().toISOString(), done = L.completedYears(joinDate), quota = state.settings.annualQuota;
-  const b = F.writeBatch(db);
-  b.set(F.doc(db, 'users', uid), { username, name, role, employeeId: nid, email, companyId, companyIds, createdAt: now });
+  const now = new Date().toISOString(), b = F.writeBatch(db);
+  if (isSuper) {
+    b.set(F.doc(db, 'users', uid), { username, name, role, email, createdAt: now, createdBy: state.user.name });
+    b.set(F.doc(db, 'usernames', username), { email, uid });
+    await b.commit(); bust();
+    return { nid, email };
+  }
+  const done = L.completedYears(joinDate), quota = state.settings.annualQuota, link = employeeRequestId ? { employeeRequestId } : {};
+  b.set(F.doc(db, 'users', uid), { username, name, role, employeeId: nid, email, companyId, companyIds, createdAt: now, ...link });
   b.set(F.doc(db, 'usernames', username), { email, uid });
-  b.set(F.doc(db, 'employees', nid), { name, joinDate, companyId, leaveBalance: done >= 1 ? quota : 0, renewedYears: done, createdAt: now });
+  b.set(F.doc(db, 'employees', nid), { name, joinDate, companyId, leaveBalance: done >= 1 ? quota : 0, renewedYears: done, createdAt: now, ...link });
   if (done >= 1) b.set(F.doc(F.collection(db, 'ledger')), { employeeId: nid, employeeName: name, companyId, ts: now, type: 'Saldo awal', amount: quota, balanceAfter: quota, note: `Jatah tahun berjalan (masa kerja ${done} tahun)`, by: state.user.name });
+  if (employeeRequestId) b.update(F.doc(db, 'employeeRequests', employeeRequestId), { status: 'created', employeeId: nid, createdBy: state.user.name, createdByUid: state.user.uid, createdAt: now });
   await b.commit();
   bust();
   return { nid, email };
 }
 
 async function accountForm({ roles, title }) {
+  roles = roles.slice();
   const myCos = state.companies.filter((c) => c.active !== false && access().includes(c.id));
-  if (!myCos.length) { await info('Belum ada PT', '<p>Tambahkan PT lebih dulu di menu Perusahaan, lalu buat akunnya.</p>'); return false; }
+  if (!myCos.length) {
+    if (!roles.includes('superuser')) { await info('Belum ada PT', '<p>Tambahkan PT lebih dulu di menu Perusahaan, lalu buat akunnya.</p>'); return false; }
+    roles = ['superuser'];
+  }
   const grantable = C.grantableIds(state.user, state.companies);
-  const opts = roles.map((r) => `<option value="${r}">${esc(roleLabel(r))}</option>`).join('');
+  const opts = roles.map((r) => `<option value="${r}">${esc(r === 'superuser' ? 'Superuser (owner tambahan)' : roleLabel(r))}</option>`).join('');
   const coOpts = myCos.map((c) => `<option value="${esc(c.id)}"${state.scope === c.id ? ' selected' : ''}>${esc(c.name)}</option>`).join('');
   const extra = grantable.length > 1
     ? `<div class="field"><label>Boleh melihat PT lain (opsional)</label><div class="checks" id="acExtra">${state.companies.filter((c) => grantable.includes(c.id)).map((c) => `<label class="check"><input type="checkbox" value="${esc(c.id)}"> ${esc(c.name)}</label>`).join('')}</div><div class="hint">Akun ini juga bisa melihat karyawan di PT yang dicentang, selain PT utamanya.</div></div>`
@@ -800,21 +943,24 @@ async function accountForm({ roles, title }) {
     title,
     body: `<div class="field"><label for="acName">Nama lengkap</label><input type="text" id="acName"></div>
       <div class="field"><label for="acUser">Username</label><input type="text" id="acUser" autocapitalize="none"></div>
-      <div class="field"><label for="acCompany">PT</label><select id="acCompany">${coOpts}</select></div>
-      <div class="row2"><div class="field"><label for="acRole">Role</label><select id="acRole">${opts}</select></div>
-      <div class="field"><label for="acJoin">Tanggal bergabung</label><input type="date" id="acJoin"></div></div>
-      ${extra}
+      <div class="field"><label for="acRole">Role</label><select id="acRole" data-input="ac-role">${opts}</select><div class="hint" id="acSuperHint" hidden>Superuser punya akses penuh ke semua PT dan pengaturan. Hanya Superuser yang bisa menambahkannya.</div></div>
+      <div id="acStd"><div class="field"><label for="acCompany">PT</label><select id="acCompany">${coOpts || '<option value="">-</option>'}</select></div>
+      <div class="field"><label for="acJoin">Tanggal bergabung</label><input type="date" id="acJoin"></div>
+      ${extra}</div>
       <div class="field"><label for="acPass">Password awal</label><input type="text" id="acPass" value="${pw}"><div class="hint">Berikan ke karyawan, lalu sarankan segera menggantinya di menu Profil.</div></div>`,
     okLabel: 'Buat akun',
     validate: () => {
       if (!$('#acName').value.trim()) return 'Isi nama lengkap.';
       const ue = L.validateUsername(L.normalizeUsername($('#acUser').value)); if (ue) return ue;
-      if (!$('#acCompany').value) return 'Pilih PT.';
-      if (!L.parseDate($('#acJoin').value)) return 'Isi tanggal bergabung.';
+      if ($('#acRole').value !== 'superuser') {
+        if (!$('#acCompany').value) return 'Pilih PT.';
+        if (!L.parseDate($('#acJoin').value)) return 'Isi tanggal bergabung.';
+      }
       if ($('#acPass').value.length < 6) return 'Password minimal 6 karakter.';
       return '';
     },
     getValue: () => {
+      if ($('#acRole').value === 'superuser') return { name: $('#acName').value.trim(), username: L.normalizeUsername($('#acUser').value), role: 'superuser', password: $('#acPass').value };
       const home = $('#acCompany').value, chosen = $$('#acExtra input:checked').map((i) => i.value);
       return { name: $('#acName').value.trim(), username: L.normalizeUsername($('#acUser').value), role: $('#acRole').value, joinDate: $('#acJoin').value, password: $('#acPass').value,
         companyId: home, companyIds: C.nextAccessList({ home, current: [home], chosen, grantable }) };
@@ -822,7 +968,7 @@ async function accountForm({ roles, title }) {
     onSubmit: createAccount,
   });
   if (!v) return false;
-  await info('Akun dibuat', `<p>Catat dan berikan kepada karyawan:</p><p style="margin-top:10px">Username: <code>${esc(v.username)}</code><br>Password: <code>${esc(v.password)}</code><br>PT: <b>${esc(coName(v.companyId))}</b></p>`);
+  await info('Akun dibuat', `<p>Catat dan berikan kepada karyawan:</p><p style="margin-top:10px">Username: <code>${esc(v.username)}</code><br>Password: <code>${esc(v.password)}</code>${v.companyId ? `<br>PT: <b>${esc(coName(v.companyId))}</b>` : '<br>Role: <b>Superuser</b>'}</p>`);
   return true;
 }
 
@@ -932,7 +1078,7 @@ pages.settings = async () => {
       <div class="row2"><div class="field"><label for="stQuota">Jatah cuti tahunan (hari)</label><input type="number" id="stQuota" min="1" max="60" value="${s.annualQuota}"><div class="hint">Diberikan setiap karyawan genap 1, 2, 3, … tahun masa kerja.</div></div>
       <div class="field"><label for="stCarry">Maksimal sisa cuti dibawa (hari)</label><input type="number" id="stCarry" min="0" max="60" value="${s.maxCarryOver}"><div class="hint">0 = sisa cuti hangus saat pembaruan. Hutang selalu dipotong dari jatah baru.</div></div></div>
       <div class="row2"><div class="field"><label for="stLock">Kunci bulan lalu setelah tanggal</label><input type="number" id="stLock" min="1" max="28" value="${s.lockDay}"></div>
-      <div class="field"><label>&nbsp;</label><label class="check"><input type="checkbox" id="stWeekend" ${s.excludeWeekends ? 'checked' : ''}> Sabtu dan Minggu tidak dihitung sebagai hari cuti</label></div></div>
+      <div class="field"><label for="stIzin">Peringatan izin berlebih (kali per bulan)</label><input type="number" id="stIzin" min="2" max="31" value="${izinWarn()}"><div class="hint">Bila izin (sakit, keluarga sakit, izin lainnya) mencapai angka ini dalam sebulan, HRD dan Direktur diberi tanda. Sabtu, Minggu, dan tanggal merah selalu tidak dihitung sebagai hari cuti.</div></div></div>
       <button class="btn btn-primary" type="submit">Simpan pengaturan</button></form></section>`
     + card('Pembaruan cuti tahunan', `<p style="margin-bottom:12px">Pembaruan berjalan otomatis saat Staff HRD, Kepala HRD, atau Superuser membuka portal. Anda juga bisa menjalankannya sekarang.</p><button class="btn btn-line" data-act="run-renewal">Jalankan pembaruan sekarang</button>`);
 };
@@ -942,7 +1088,9 @@ async function saveSettings() {
   if (!(q >= 1 && q <= 60)) return toast('Jatah cuti harus 1–60 hari.', 'err');
   if (!(c >= 0 && c <= 60)) return toast('Batas sisa cuti harus 0–60 hari.', 'err');
   if (!(l >= 1 && l <= 28)) return toast('Tanggal kunci harus 1–28.', 'err');
-  const next = { annualQuota: q, maxCarryOver: c, lockDay: l, excludeWeekends: $('#stWeekend').checked };
+  const iz = parseInt($('#stIzin').value, 10);
+  if (!(iz >= 2 && iz <= 31)) return toast('Batas peringatan izin harus 2–31.', 'err');
+  const next = { annualQuota: q, maxCarryOver: c, lockDay: l, excludeWeekends: true, izinWarn: iz };
   try { await F.setDoc(F.doc(db, 'settings', 'leave'), next); state.settings = { ...L.DEFAULT_SETTINGS, ...next }; toast('Pengaturan disimpan.', 'ok'); }
   catch (e) { toast(errMsg(e), 'err'); }
 }
@@ -952,8 +1100,8 @@ pages.accounts = async () => {
   const users = (await listAll('users')).slice().sort((a, b) => a.name.localeCompare(b.name, 'id'));
   const rows = users.map((x) => `<tr data-q="${esc((x.name + ' ' + x.username).toLowerCase())}"><td><div style="display:flex;gap:10px;align-items:center">${avatar(x, 'sm')}<b>${esc(x.name)}</b></div></td>
     <td><code>${esc(x.username)}</code></td><td><span class="badge b-role">${esc(roleLabel(x.role))}</span></td><td>${x.role === 'superuser' ? '<span class="sub">Semua PT</span>' : coChips(x)}</td>
-    <td>${x.id === state.user.uid ? '<span class="sub">Akun Anda</span>' : `<div class="btn-row">${x.role !== 'superuser' ? `<button class="btn btn-line btn-sm" data-act="acc-access" data-uid="${esc(x.id)}">Akses PT</button>` : ''}<button class="btn btn-line btn-sm" data-act="acc-reset" data-id="${esc(x.id)}">Reset password</button>${x.role !== 'superuser' ? `<button class="btn btn-ghost btn-sm" data-act="acc-del" data-id="${esc(x.id)}">Hapus</button>` : ''}</div>`}</td></tr>`).join('');
-  return pageHead('Akun', 'Password disimpan aman oleh Firebase Authentication dan tidak bisa dilihat siapa pun.', '<button class="btn btn-primary" data-act="acc-add">Tambah akun</button>')
+    <td>${x.id === state.user.uid ? '<span class="sub">Akun Anda</span>' : `<div class="btn-row">${x.role !== 'superuser' ? `<button class="btn btn-line btn-sm" data-act="acc-access" data-uid="${esc(x.id)}">Akses PT</button>` : ''}<button class="btn btn-line btn-sm" data-act="acc-reset" data-id="${esc(x.id)}">Reset password</button><button class="btn btn-ghost btn-sm" data-act="acc-del" data-id="${esc(x.id)}">Hapus</button></div>`}</td></tr>`).join('');
+  return pageHead('Akun', 'Superuser bisa lebih dari satu dan hanya Superuser yang bisa menambahkannya. Password disimpan aman oleh Firebase Authentication.', '<button class="btn btn-primary" data-act="acc-add">Tambah akun</button>')
     + `<section class="card"><div class="toolbar"><input type="text" id="accSearch" data-input="search" data-target="#accBody" data-counter="#accCount" placeholder="Cari nama atau username" aria-label="Cari akun"><span class="count" id="accCount">${users.length} akun</span></div>
     <div class="tw"><table><thead><tr><th>Nama</th><th>Username</th><th>Role</th><th>PT</th><th></th></tr></thead><tbody id="accBody">${rows}</tbody></table></div></section>`;
 };
@@ -984,9 +1132,9 @@ async function resetLogin(uid) {
 }
 
 async function deleteAccount(uid) {
-  const t = (await listAll('users')).find((x) => x.id === uid); if (!t || t.role === 'superuser') return;
+  const t = (await listAll('users')).find((x) => x.id === uid); if (!t || uid === state.user.uid) return;
   if (t.employeeId) return deleteEmployee(t.employeeId);
-  const ok = await confirmBox(`Hapus akun ${t.name}?`, 'Akun tidak bisa login lagi.', 'Hapus', true);
+  const ok = await confirmBox(`Hapus akun ${t.name}?`, t.role === 'superuser' ? 'Superuser ini tidak bisa login lagi. Pastikan masih ada Superuser lain.' : 'Akun tidak bisa login lagi.', 'Hapus', true);
   if (!ok) return;
   try {
     const b = F.writeBatch(db);
@@ -1091,112 +1239,350 @@ async function companyForm(c) {
   if (v) go('companies');
 }
 
-// ---------- Kalender libur ----------
+// ---------- Kalender Kerja ----------
 const MONTH_NAMES = Array.from({ length: 12 }, (_, i) => L.monthName(i));
-const selDays = (sel) => (sel ? C.countLeaveDays(sel.a, sel.b) : 0);
-function selText() {
-  const sel = state.cal.sel;
-  if (!sel) return 'Belum ada tanggal dipilih. Klik satu tanggal, lalu klik tanggal lain untuk membuat rentang.';
-  return sel.a === sel.b ? `${fd(sel.a)} (1 hari)` : `${fd(sel.a)} – ${fd(sel.b)} (${selDays(sel)} hari)`;
+const ymStr = () => `${state.cal.y}-${String(state.cal.m + 1).padStart(2, '0')}`;
+const monthLabel = (ym) => { const r = W.monthRange(ym); return r ? `${MONTH_NAMES[r.m]} ${r.y}` : ym; };
+const strip = (a) => a.map(({ start, end, name }) => ({ start, end, name }));
+function draftFor(ym) {
+  if (!state.cal.drafts[ym]) state.cal.drafts[ym] = strip(W.itemsOfMonth(state.holidays, ym));
+  return state.cal.drafts[ym];
 }
-function calendarHtml() {
-  const { y, m, sel } = state.cal, canP = C.canProposeHoliday(state.user.role), today = L.toISODate(new Date());
-  const pend = (state.holDocs || []).filter((h) => h.status === 'pending');
+const holRange = (h) => (h.start === h.end ? fd(h.start) : `${fd(h.start)} – ${fd(h.end)}`);
+const listBatches = async () => snapList(await F.getDocs(F.collection(db, 'holidayBatches'))).sort(byDateDesc('requestedAt'));
+const batchBadge = (s) => `<span class="badge ${s === 'approved' ? 'b-ok' : s === 'pending' ? 'b-pending' : 'b-no'}">${esc(W.BATCH_STATUS[s] || s)}</span>`;
+const itemList = (a) => a.map((i) => `${esc(holRange(i))} (${esc(i.name)})`).join(', ');
+
+function calendarHtml(ym, pendItems, draft) {
+  const { y, m } = state.cal, today = L.toISODate(new Date());
   const cell = (d) => {
     if (!d) return '<span class="cal-blank"></span>';
-    const dt = L.parseDate(d), dow = dt.getDay(), hol = C.holidayAt(d, state.holidays), pd = hol ? null : C.holidayAt(d, pend);
-    const cls = ['cal-d', (dow === 0 || dow === 6) && 'we', hol && 'hol', pd && 'pend', sel && sel.a <= d && d <= sel.b && 'sel', d === today && 'today'].filter(Boolean).join(' ');
-    const title = hol ? hol.name : pd ? `${pd.name} (menunggu Direktur)` : '';
-    const label = `${fd(d)}${hol ? ', libur ' + hol.name : pd ? ', libur menunggu Direktur' : ''}`;
-    return canP ? `<button type="button" class="${cls}" data-act="cal-pick" data-d="${d}" aria-label="${esc(label)}"${title ? ` title="${esc(title)}"` : ''}>${dt.getDate()}</button>`
-      : `<span class="${cls}" aria-label="${esc(label)}"${title ? ` title="${esc(title)}"` : ''}>${dt.getDate()}</span>`;
+    const dt = L.parseDate(d), dow = dt.getDay(), hol = C.holidayAt(d, state.holidays);
+    const pd = pendItems ? C.holidayAt(d, pendItems) : null, dr = draft ? C.holidayAt(d, draft) : null;
+    const cls = ['cal-d', (dow === 0 || dow === 6) && 'we', hol && 'hol', draft && !hol && dr && 'draft', draft && hol && !dr && 'rm', !draft && !hol && pd && 'pend', d === today && 'today'].filter(Boolean).join(' ');
+    const nm = hol ? hol.name : dr ? dr.name : pd ? pd.name : (dow === 0 || dow === 6) ? 'Akhir pekan' : '';
+    return `<span class="${cls}" title="${esc(nm)}" aria-label="${esc(fd(d) + (nm ? ', ' + nm : ''))}">${dt.getDate()}</span>`;
   };
   return `<div class="cal-head"><button class="btn btn-line btn-sm" data-act="cal-nav" data-d="-1" aria-label="Bulan sebelumnya">‹</button><h3>${MONTH_NAMES[m]} ${y}</h3><button class="btn btn-line btn-sm" data-act="cal-nav" data-d="1" aria-label="Bulan berikutnya">›</button></div>
     <div class="cal-grid" role="group" aria-label="Kalender ${MONTH_NAMES[m]} ${y}">${['Sen', 'Sel', 'Rab', 'Kam', 'Jum', 'Sab', 'Min'].map((d) => `<span class="cal-w">${d}</span>`).join('')}${C.monthGrid(y, m).flat().map(cell).join('')}</div>
-    <div class="cal-legend"><span><i class="sw hol"></i>Libur berlaku, tidak memotong cuti</span><span><i class="sw pend"></i>Menunggu Direktur</span>${canP ? '<span><i class="sw sel"></i>Pilihan Anda</span>' : ''}</div>`;
+    <div class="cal-legend"><span><i class="sw we"></i>Sabtu &amp; Minggu (selalu libur)</span><span><i class="sw hol"></i>Tanggal merah berlaku</span>${draft ? '<span><i class="sw draft"></i>Akan ditambah</span><span><i class="sw rm"></i>Akan dihapus</span>' : '<span><i class="sw pend"></i>Menunggu Direktur</span>'}</div>`;
 }
-function refreshCal() {
-  const h = $('#calHost'); if (h) h.innerHTML = calendarHtml();
-  const t = $('#selText'); if (t) t.textContent = selText();
-}
-const holRange = (h) => (h.start === h.end ? fd(h.start) : `${fd(h.start)} – ${fd(h.end)}`);
-const holStatus = (s) => `<span class="badge ${s === 'approved' ? 'b-ok' : s === 'pending' ? 'b-pending' : 'b-no'}">${esc(C.HOLIDAY_STATUS[s] || s)}</span>`;
 
 pages.holidays = async () => {
   await loadHolidays();
-  state.holDocs = await listHolidays();
-  const u = state.user, canP = C.canProposeHoliday(u.role), canD = C.canDecideHoliday(u.role);
-  const approved = state.holidays.slice().sort((a, b) => (a.start < b.start ? -1 : 1));
-  const pend = state.holDocs.filter((h) => h.status === 'pending');
-  const past = state.holDocs.filter((h) => h.status !== 'pending' && h.status !== 'approved').slice(0, 20);
-  let h = pageHead('Kalender libur', canP ? 'Pilih rentang tanggal, beri nama, lalu ajukan ke Direktur. Setelah disetujui, tanggal berwarna merah tidak memotong jatah cuti.'
-    : canD ? 'Setujui libur yang diajukan Kepala HRD. Libur yang disetujui berlaku untuk semua PT.' : 'Tanggal berwarna merah adalah libur dan tidak memotong jatah cuti.');
-  h += `<section class="card"><div id="calHost">${calendarHtml()}</div></section>`;
+  const u = state.user, canP = C.canProposeHoliday(u.role), canD = C.canDecideHoliday(u.role), owner = u.role === 'superuser';
+  const ym = ymStr(), label = monthLabel(ym);
+  state.batches = canP || canD ? await listBatches() : [];
+  const cur = W.itemsOfMonth(state.holidays, ym);
+  const pendThis = state.batches.find((b) => b.status === 'pending' && b.month === ym);
+  const draft = canP && !pendThis ? draftFor(ym) : null;
+  const dif = draft ? W.diffMonth(strip(cur), draft) : null;
+  let h = pageHead('Kalender Kerja', canP ? 'Sabtu dan Minggu selalu libur. Untuk mengubah tanggal merah, gunakan tombol Add di bawah kalender, lalu Ajukan ke Direktur (per bulan).'
+    : canD ? 'Setujui perubahan tanggal merah yang diajukan Kepala HRD. Berlaku untuk semua PT.' : 'Sabtu dan Minggu selalu libur. Tanggal berwarna merah adalah libur tambahan dan tidak memotong jatah cuti.');
+  h += `<section class="card"><div id="calHost">${calendarHtml(ym, pendThis ? pendThis.items : null, draft)}</div></section>`;
+
   if (canP) {
-    h += `<section class="card"><form data-submit="holiday" novalidate><h3>Ajukan libur</h3>
-      <p id="selText" class="sel-text">${esc(selText())}</p>
-      <div class="field"><label for="hdName">Nama libur</label><input type="text" id="hdName" maxlength="60" placeholder="Contoh: Cuti bersama Natal"></div>
-      <div class="btn-row"><button class="btn btn-primary" type="submit">Ajukan ke Direktur</button><button class="btn btn-line" type="button" data-act="cal-clear">Hapus pilihan</button></div></form></section>`;
+    let inner;
+    if (pendThis) {
+      inner = `<p>Pengajuan ${esc(label)} sedang menunggu persetujuan Direktur. Anda bisa membatalkannya untuk mengubah lagi.</p><div class="sub" style="margin:8px 0">${itemList(pendThis.items) || 'Tidak ada tanggal merah'}</div>
+        <button class="btn btn-line" data-act="hol-decide" data-kind="cancel" data-id="${esc(pendThis.id)}">Batalkan pengajuan</button>`;
+    } else {
+      const rows = draft.map((it, i) => {
+        const exists = cur.some((c) => c.start === it.start && c.end === it.end && c.name === it.name);
+        return `<tr><td>${esc(holRange(it))}</td><td><b>${esc(it.name)}</b></td><td>${exists ? '<span class="badge b-ok">Berlaku</span>' : '<span class="badge b-pending">Baru</span>'}</td><td><button class="btn btn-ghost btn-sm" data-act="hol-del" data-i="${i}">Hapus</button></td></tr>`;
+      }).join('');
+      inner = `<div class="btn-row" style="margin-bottom:12px"><button class="btn btn-primary" data-act="hol-add">Add</button>${dif.changed ? '<button class="btn btn-line" data-act="hol-reset">Batalkan perubahan</button>' : ''}</div>
+        ${rows ? `<div class="tw"><table><thead><tr><th>Tanggal</th><th>Keterangan</th><th>Status</th><th></th></tr></thead><tbody>${rows}</tbody></table></div>` : emptyHtml('Belum ada tanggal merah di bulan ini', 'Klik Add untuk menambah satu tanggal atau rentang.')}
+        ${dif.removed.length ? `<p class="sub" style="margin-top:10px">Akan dihapus: ${itemList(dif.removed)}</p>` : ''}
+        <div style="margin-top:14px"><button class="btn btn-primary" data-act="hol-submit"${dif.changed ? '' : ' disabled'}>Ajukan ${esc(label)} ke Direktur</button></div>`;
+    }
+    h += card(`Ubah tanggal merah - ${label}`, inner);
   }
+
   if (canD || canP) {
-    const mineP = canD ? pend : pend.filter((x) => x.requestedByUid === u.uid);
-    h += card(`Menunggu persetujuan Direktur (${mineP.length})`, mineP.length ? mineP.map((x) => `<div class="q-item"><div class="q-main"><div class="who">${esc(x.name)}</div>
-      <div class="meta">${esc(holRange(x))} · ${C.countLeaveDays(x.start, x.end)} hari · diajukan ${esc(x.requestedBy)}</div></div>
-      <div class="q-act">${canD ? `<button class="btn btn-ok btn-sm" data-act="hol-decide" data-kind="approve" data-id="${esc(x.id)}">Setujui</button><button class="btn btn-line btn-sm" data-act="hol-decide" data-kind="reject" data-id="${esc(x.id)}">Tolak</button>`
-      : `<button class="btn btn-line btn-sm" data-act="hol-decide" data-kind="cancel" data-id="${esc(x.id)}">Batalkan</button>`}</div></div>`).join('') : emptyHtml('Tidak ada yang menunggu'));
+    const pend = state.batches.filter((b) => b.status === 'pending' && (canD || b.requestedByUid === u.uid));
+    h += card(`Menunggu persetujuan Direktur (${pend.length})`, pend.length ? pend.map((b) => `<div class="q-item"><div class="q-main"><div class="who">${esc(monthLabel(b.month))}</div>
+      <div class="meta">Diajukan ${esc(b.requestedBy)} · ${esc(W.stamp(b.requestedAt))}</div>
+      ${(b.added || []).length ? `<div class="meta">Ditambah: ${itemList(b.added)}</div>` : ''}${(b.removed || []).length ? `<div class="meta">Dihapus: ${itemList(b.removed)}</div>` : ''}</div>
+      <div class="q-act">${canD ? `<button class="btn btn-ok btn-sm" data-act="hol-decide" data-kind="approve" data-id="${esc(b.id)}">Setujui</button><button class="btn btn-line btn-sm" data-act="hol-decide" data-kind="reject" data-id="${esc(b.id)}">Tolak</button>`
+      : `<button class="btn btn-line btn-sm" data-act="hol-decide" data-kind="cancel" data-id="${esc(b.id)}">Batalkan</button>`}</div></div>`).join('') : emptyHtml('Tidak ada yang menunggu'));
   }
-  h += card('Libur yang berlaku', approved.length ? `<div class="tw"><table><thead><tr><th>Tanggal</th><th>Nama</th><th>Hari</th>${canD ? '<th></th>' : ''}</tr></thead><tbody>${approved.map((x) => `<tr><td>${esc(holRange(x))}</td><td><b>${esc(x.name)}</b></td><td>${C.countLeaveDays(x.start, x.end)}</td>${canD ? `<td><button class="btn btn-ghost btn-sm" data-act="hol-decide" data-kind="revoke" data-id="${esc(x.id)}">Cabut</button></td>` : ''}</tr>`).join('')}</tbody></table></div>`
-    : emptyHtml('Belum ada libur', 'Libur yang disetujui Direktur akan muncul di sini.'));
-  if ((canD || canP) && past.length) h += card('Riwayat pengajuan', `<div class="tw"><table><thead><tr><th>Tanggal</th><th>Nama</th><th>Status</th></tr></thead><tbody>${past.map((x) => `<tr><td>${esc(holRange(x))}</td><td>${esc(x.name)}</td><td>${holStatus(x.status)}</td></tr>`).join('')}</tbody></table></div>`);
+
+  h += card(`Libur yang berlaku - ${label}`, `<p class="sub" style="margin-bottom:10px">Sabtu dan Minggu selalu libur. Tanggal merah di bawah ini tidak memotong jatah cuti.</p>`
+    + (cur.length ? `<div class="tw"><table><thead><tr><th>Tanggal</th><th>Keterangan</th><th>Hari</th></tr></thead><tbody>${cur.map((x) => `<tr><td>${esc(holRange(x))}</td><td><b>${esc(x.name)}</b></td><td>${C.countLeaveDays(x.start, x.end)}</td></tr>`).join('')}</tbody></table></div>` : emptyHtml('Tidak ada tanggal merah di bulan ini')));
+
+  if (canD || canP) {
+    const past = state.batches.filter((b) => b.status !== 'pending').slice(0, 10);
+    if (past.length) h += card('Riwayat pengajuan', `<div class="tw"><table><thead><tr><th>Bulan</th><th>Perubahan</th><th>Status</th></tr></thead><tbody>${past.map((b) => `<tr><td>${esc(monthLabel(b.month))}</td><td><span class="sub">${[(b.added || []).length ? 'Ditambah: ' + itemList(b.added) : '', (b.removed || []).length ? 'Dihapus: ' + itemList(b.removed) : ''].filter(Boolean).join(' · ') || '-'}</span></td><td>${batchBadge(b.status)}</td></tr>`).join('')}</tbody></table></div>`);
+  }
+
+  if (owner) {
+    let log = [];
+    try { log = snapList(await F.getDocs(F.collection(db, 'calendarLog'))).filter((x) => x.month === ym).sort(byDateDesc('at')); } catch (e) { console.warn('calendarLog', e); }
+    h += card(`Riwayat perubahan - ${label}`, log.length ? `<div class="tw"><table><thead><tr><th>Waktu</th><th>Keputusan</th><th>Disetujui / diputuskan oleh</th><th>Diajukan oleh</th><th>Perubahan</th></tr></thead><tbody>${log.map((x) => `<tr><td class="mono">${esc(W.stamp(x.at))}</td><td>${batchBadge(x.action)}</td><td><b>${esc(x.by)}</b> <span class="sub">${esc(roleLabel(x.byRole))}</span></td><td>${esc(x.requestedBy)}</td>
+      <td><span class="sub">${[(x.added || []).length ? 'Ditambah: ' + itemList(x.added) : '', (x.removed || []).length ? 'Dihapus: ' + itemList(x.removed) : ''].filter(Boolean).join(' · ') || '-'}</span></td></tr>`).join('')}</tbody></table></div>`
+      : emptyHtml('Belum ada perubahan', 'Persetujuan perubahan kalender bulan ini akan tercatat lengkap dengan jam, menit, dan detik.'));
+  }
   return h;
 };
 
-async function proposeHoliday() {
-  const sel = state.cal.sel, name = $('#hdName').value.trim();
-  const err = C.validateHoliday({ start: sel && sel.a, end: sel && sel.b, name });
-  if (err) return toast(err, 'err');
-  if (!C.canProposeHoliday(state.user.role)) return toast('Hanya Kepala HRD yang bisa mengajukan libur.', 'err');
-  const clash = state.holidays.find((r) => L.rangesOverlap(sel.a, sel.b, r.start, r.end));
-  if (clash) return toast(`Bertabrakan dengan libur "${clash.name}". Minta Direktur mencabutnya lebih dulu bila ingin mengubah.`, 'err');
-  await F.addDoc(F.collection(db, 'holidays'), { start: sel.a, end: sel.b, name, status: 'pending', requestedBy: state.user.name, requestedByUid: state.user.uid, requestedAt: new Date().toISOString() });
-  state.cal.sel = null; bust(); toast('Libur diajukan ke Direktur.', 'ok'); go('holidays');
+async function addHolidayItem() {
+  const ym = ymStr(), r = W.monthRange(ym);
+  const v = await dialog({
+    title: `Add tanggal merah - ${monthLabel(ym)}`,
+    body: `<div class="row2"><div class="field"><label for="hdA">Tanggal</label><input type="date" id="hdA" min="${r.first}" max="${r.last}" value="${r.first}"></div>
+      <div class="field"><label for="hdB">Sampai tanggal (opsional)</label><input type="date" id="hdB" min="${r.first}" max="${r.last}"><div class="hint">Kosongkan jika hanya 1 tanggal.</div></div></div>
+      <div class="field"><label for="hdName">Keterangan</label><input type="text" id="hdName" maxlength="60" placeholder="Contoh: Cuti bersama Natal"></div>`,
+    okLabel: 'Tambahkan',
+    getValue: () => ({ start: $('#hdA').value, end: $('#hdB').value || $('#hdA').value, name: $('#hdName').value.trim() }),
+    validate: () => { const a = $('#hdA').value, b = $('#hdB').value || a; return W.addToDraft(draftFor(ym), { start: a, end: b, name: $('#hdName').value }, ym).error || ''; },
+    onSubmit: (it) => { state.cal.drafts[ym] = W.addToDraft(draftFor(ym), it, ym).items; },
+  });
+  if (v) go('holidays');
+}
+
+async function submitHolidayBatch() {
+  if (!C.canProposeHoliday(state.user.role)) throw new Error('Hanya Kepala HRD yang bisa mengajukan perubahan kalender.');
+  const ym = ymStr(), draft = draftFor(ym);
+  const dif = W.diffMonth(W.itemsOfMonth(state.holidays, ym), draft);
+  if (!dif.changed) return toast('Belum ada perubahan untuk diajukan.', 'err');
+  const fresh = await listBatches();
+  if (fresh.some((b) => b.status === 'pending' && b.month === ym)) throw new Error('Masih ada pengajuan bulan ini yang menunggu Direktur.');
+  if (!(await confirmBox(`Ajukan ${monthLabel(ym)}?`, `${dif.added.length} tanggal ditambah, ${dif.removed.length} dihapus. Pengajuan dikirim ke Direktur.`, 'Ajukan'))) return;
+  await F.addDoc(F.collection(db, 'holidayBatches'), { month: ym, items: draft, added: dif.added, removed: dif.removed, status: 'pending', requestedBy: state.user.name, requestedByUid: state.user.uid, requestedAt: new Date().toISOString() });
+  delete state.cal.drafts[ym]; bust(); toast('Diajukan ke Direktur.', 'ok'); go('holidays'); updateCounts();
 }
 
 async function holDecide(el) {
   const { id, kind } = el.dataset, u = state.user;
   const cfg = {
-    approve: ['Setujui libur?', 'Tanggal ini diwarnai merah dan tidak memotong jatah cuti karyawan di semua PT, termasuk pengajuan yang masih menunggu.', 'Setujui', false],
-    reject: ['Tolak libur?', 'Pengajuan libur ini ditolak.', 'Tolak', true],
-    revoke: ['Cabut libur?', 'Tanggal ini tidak lagi libur. Cuti yang sudah disetujui tidak berubah.', 'Cabut', true],
-    cancel: ['Batalkan pengajuan?', 'Pengajuan libur ini dibatalkan.', 'Batalkan', true],
+    approve: ['Setujui perubahan kalender?', 'Tanggal merah bulan ini diganti sesuai pengajuan, berlaku untuk semua PT dan tidak memotong jatah cuti. Persetujuan Anda dicatat lengkap dengan jam.', 'Setujui', false],
+    reject: ['Tolak pengajuan?', 'Kalender tidak berubah.', 'Tolak', true],
+    cancel: ['Batalkan pengajuan?', 'Pengajuan ini dibatalkan.', 'Batalkan', true],
   }[kind];
   if (!cfg || !(await confirmBox(cfg[0], cfg[1], cfg[2], cfg[3]))) return;
-  const href = F.doc(db, 'holidays', id), cref = F.doc(db, 'calendar', 'holidays');
+  const href = F.doc(db, 'holidayBatches', id), cref = F.doc(db, 'calendar', 'holidays');
   await F.runTransaction(db, async (tx) => {
     const hs = await tx.get(href), cs = await tx.get(cref);
-    if (!hs.exists()) throw new Error('Pengajuan libur tidak ditemukan.');
-    const h = hs.data(), ranges = cs.exists() ? cs.data().ranges || [] : [], now = new Date().toISOString();
+    if (!hs.exists()) throw new Error('Pengajuan tidak ditemukan.');
+    const bt = hs.data(), now = new Date().toISOString();
+    if (bt.status !== 'pending') throw new Error('Pengajuan ini sudah diproses.');
     const who = { decidedBy: u.name, decidedByUid: u.uid, decidedAt: now };
     if (kind === 'cancel') {
-      if (h.status !== 'pending' || h.requestedByUid !== u.uid) throw new Error('Hanya pengaju yang bisa membatalkan pengajuan yang masih menunggu.');
+      if (bt.requestedByUid !== u.uid) throw new Error('Hanya pengaju yang bisa membatalkan.');
       tx.update(href, { status: 'cancelled', ...who });
       return;
     }
-    if (!C.canDecideHoliday(u.role)) throw new Error('Hanya Direktur yang bisa memutuskan libur.');
-    if (kind === 'revoke') {
-      if (h.status !== 'approved') throw new Error('Libur ini tidak sedang berlaku.');
-      tx.update(href, { status: 'revoked', ...who });
-      tx.set(cref, { ranges: C.removeRange(ranges, id), updatedAt: now });
-      return;
-    }
-    if (h.status !== 'pending') throw new Error('Pengajuan ini sudah diproses.');
-    if (kind === 'reject') { tx.update(href, { status: 'rejected', ...who }); return; }
-    tx.update(href, { status: 'approved', ...who });
-    tx.set(cref, { ranges: C.addRange(ranges, { id, start: h.start, end: h.end, name: h.name }), updatedAt: now });
+    if (!C.canDecideHoliday(u.role)) throw new Error('Hanya Direktur yang bisa memutuskan perubahan kalender.');
+    const action = kind === 'approve' ? 'approved' : 'rejected';
+    tx.update(href, { status: action, ...who });
+    if (kind === 'approve') tx.set(cref, { ranges: W.applyBatch(cs.exists() ? cs.data().ranges || [] : [], bt.month, bt.items || [], id), updatedAt: now });
+    tx.set(F.doc(F.collection(db, 'calendarLog')), { month: bt.month, batchId: id, action, at: now, by: u.name, byUid: u.uid, byRole: u.role, requestedBy: bt.requestedBy, requestedAt: bt.requestedAt, added: bt.added || [], removed: bt.removed || [] });
   });
   await loadHolidays(); bust();
-  toast({ approve: 'Libur disetujui.', reject: 'Libur ditolak.', revoke: 'Libur dicabut.', cancel: 'Pengajuan dibatalkan.' }[kind], 'ok');
+  toast({ approve: 'Kalender diperbarui.', reject: 'Pengajuan ditolak.', cancel: 'Pengajuan dibatalkan.' }[kind], 'ok');
   go('holidays'); updateCounts();
+}
+
+// ---------- Laporan Absensi ----------
+const ATT_ROLES = ['staff_hrd', 'kepala_hrd', 'direktur', 'superuser'];
+const CODE_FILL = { L: 'E4E0D8', C: 'CFE0F3', S: 'FBD9B5', I: 'FFF1A8', K: 'E1D3F2', T: 'F6C5C5', P: 'F6C5C5', H: 'D3EBD3' };
+const CODE_STYLE = { L: STYLE.OFF, C: STYLE.C, S: STYLE.S, I: STYLE.I, K: STYLE.K, T: STYLE.LATE, P: STYLE.LATE, H: STYLE.H };
+const cellCode = (c) => (c.code === 'H' && !c.late ? 'H' : (c.code + c.late));
+const attMonths = () => {
+  const now = new Date(), out = [];
+  for (let i = 0; i < 12; i++) { const d = new Date(now.getFullYear(), now.getMonth() - i, 1); out.push({ v: `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`, y: d.getFullYear(), m: d.getMonth() }); }
+  if (!out.some((m) => m.v === state.attMonth)) state.attMonth = out[0].v;
+  return out;
+};
+async function attBuild() {
+  if (!ATT_ROLES.includes(state.user.role)) throw new Error('Laporan absensi hanya untuk Staff HRD, Kepala HRD, Direktur, dan Superuser.');
+  const months = attMonths(), sel = months.find((m) => m.v === state.attMonth);
+  await loadHolidays();
+  const [employees, requests] = await Promise.all([getEmployees(), listAll('requests')]);
+  const att = R.buildAttendance({ employees, requests, holidays: state.holidays, year: sel.y, month: sel.m });
+  const detail = R.detailRows({ employees, requests, year: sel.y, month: sel.m });
+  const ids = state.scope === 'all' ? access() : [state.scope];
+  const cos = state.companies.filter((c) => ids.includes(c.id)).map((c) => c.name).join(', ') || '-';
+  return { months, sel, att, detail, cos };
+}
+const legendText = 'H hadir · C cuti · S sakit · I izin · K cuti khusus · T datang terlambat · P pulang terlambat · L libur (Sabtu/Minggu/tanggal merah)';
+
+pages.attendance = async () => {
+  const { months, sel, att, detail, cos } = await attBuild();
+  const sumHead = ['ID', 'Nama', 'PT', 'Hari kerja', 'Hadir', 'Cuti', 'Sakit', 'Izin', 'Khusus', 'Datang terlambat', 'Pulang terlambat'];
+  const rows = att.rows.map((r) => `<tr><td>${esc(r.emp.id)}</td><td><b>${esc(r.emp.name)}</b></td><td>${esc(coName(r.emp.companyId))}</td><td>${att.workDays}</td><td>${r.sums.H}</td><td>${r.sums.C}</td><td>${r.sums.S}</td><td>${r.sums.I}</td><td>${r.sums.K}</td><td>${r.sums.T}</td><td>${r.sums.P}</td></tr>`).join('');
+  const mhead = att.days.map((d) => `<th class="mc${d.off ? ' off' : ''}">${d.day}</th>`).join('');
+  const mrows = att.rows.map((r) => `<tr><td class="mname"><b>${esc(r.emp.name)}</b></td>${r.cells.map((c) => `<td class="mc c-${esc((c.code || '-').toLowerCase())}">${esc(cellCode(c))}</td>`).join('')}</tr>`).join('');
+  return pageHead('Laporan Absensi', `${att.label} · ${cos}`, `<button class="btn btn-line btn-sm" data-act="att-xlsx">Unduh Excel</button><button class="btn btn-primary btn-sm" data-act="att-pdf">Unduh PDF</button>`)
+    + `<div class="toolbar"><select id="attMonth" data-input="att-month" aria-label="Pilih bulan">${months.map((m) => `<option value="${m.v}" ${m.v === sel.v ? 'selected' : ''}>${L.monthName(m.m)} ${m.y}</option>`).join('')}</select></div>`
+    + banner('info', '', `Hadir dihitung dari hari kerja dikurangi cuti, izin, dan sakit yang sudah disetujui. Sistem ini tidak membaca mesin absen. ${legendText}.`)
+    + card(`Rekap (${att.rows.length} karyawan)`, att.rows.length ? `<div class="tw"><table><thead><tr>${sumHead.map((h) => `<th>${h}</th>`).join('')}</tr></thead><tbody>${rows}</tbody></table></div>` : emptyHtml('Belum ada karyawan', 'Pilih PT lain atau tambahkan karyawan.'))
+    + card('Harian', att.rows.length ? `<div class="tw"><table class="matrix"><thead><tr><th class="mname">Nama</th>${mhead}</tr></thead><tbody>${mrows}</tbody></table></div>` : emptyHtml('Belum ada data'))
+    + card(`Rincian pengajuan disetujui (${detail.length})`, detail.length ? `<div class="tw"><table><thead><tr><th>Nama</th><th>Jenis</th><th>Periode</th><th>Hari</th><th>Keterangan</th></tr></thead><tbody>${detail.map((d) => `<tr><td><b>${esc(d.name)}</b></td><td>${esc(d.kind)}${d.family ? ` (${esc(d.family)})` : ''}</td><td>${esc(holRange({ start: d.start, end: d.end }))}</td><td>${d.auto ? '-' : d.days}</td><td><span class="sub">${esc(d.detail)}</span></td></tr>`).join('')}</tbody></table></div>` : emptyHtml('Tidak ada pengajuan disetujui bulan ini'));
+};
+
+function downloadBytes(name, bytes, mime) {
+  const url = URL.createObjectURL(new Blob([bytes], { type: mime }));
+  const a = document.createElement('a'); a.href = url; a.download = name; document.body.appendChild(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 1500);
+}
+const sumCols = ['H', 'C', 'S', 'I', 'K', 'T', 'P'];
+const fileMonth = () => state.attMonth;
+
+async function exportAttendanceXlsx() {
+  const { att, detail, cos } = await attBuild();
+  if (!att.rows.length) return toast('Belum ada data untuk diunduh.', 'err');
+  const meta = [[{ v: `Laporan Absensi - ${att.label}`, s: STYLE.TITLE }], [`PT: ${cos}`], [`Dibuat ${W.stamp(new Date().toISOString())} oleh ${state.user.name}`], [legendText], []];
+  const H = (arr) => arr.map((v) => ({ v, s: STYLE.HEAD }));
+  const sum = R.summaryTable(att, coName);
+  const rekap = [...meta, H(sum.head), ...sum.body.map((r) => r.map((v, i) => ({ v, s: i < 3 ? STYLE.TEXT : STYLE.NUM })))];
+  const mx = R.matrixTable(att, coName);
+  const harian = [...meta, H([...mx.head, ...sumCols]),
+    ...att.rows.map((r, ri) => [{ v: r.emp.id, s: STYLE.TEXT }, { v: r.emp.name, s: STYLE.TEXT }, { v: coName(r.emp.companyId), s: STYLE.TEXT },
+      ...r.cells.map((c) => { const v = cellCode(c); return v ? { v, s: CODE_STYLE[v[0]] || STYLE.CENTER } : { v: '', s: STYLE.CENTER }; }),
+      ...sumCols.map((k) => ({ v: r.sums[k], s: STYLE.NUM }))])];
+  const dt = R.detailTable(detail, coName);
+  const det = [...meta, H(dt.head), ...dt.body.map((r) => r.map((v) => ({ v, s: STYLE.TEXT })))];
+  const bytes = buildXlsx([
+    { name: 'Rekap', rows: rekap, widths: [10, 30, 22, 11, 9, 9, 9, 9, 10, 18, 18], freeze: { row: 6, col: 2 } },
+    { name: 'Harian', rows: harian, widths: [10, 28, 20, ...att.days.map(() => 5), ...sumCols.map(() => 5)], freeze: { row: 6, col: 2 } },
+    { name: 'Rincian', rows: det, widths: [10, 28, 20, 30, 7, 12, 12, 10, 40, 28], freeze: { row: 6, col: 0 } },
+  ]);
+  downloadBytes(`absensi-${fileMonth()}.xlsx`, bytes, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  toast('File Excel diunduh.', 'ok');
+}
+
+async function exportAttendancePdf() {
+  const { att, detail, cos } = await attBuild();
+  if (!att.rows.length) return toast('Belum ada data untuk diunduh.', 'err');
+  const fc = (v) => (v ? { t: v, fill: CODE_FILL[v[0]] || '' } : '');
+  const sum = R.summaryTable(att, coName), mx = R.matrixTable(att, coName), dt = R.detailTable(detail, coName);
+  const bytes = buildPdf({
+    footer: `Laporan Absensi ${att.label} - ${cos}`,
+    blocks: [
+      { type: 'title', text: `Laporan Absensi - ${att.label}` },
+      { type: 'note', text: `PT: ${cos}\nDibuat ${W.stamp(new Date().toISOString())} oleh ${state.user.name}\n${legendText}\nHadir = hari kerja dikurangi cuti, izin, dan sakit yang disetujui.` },
+      { type: 'table', heading: 'Rekap', head: sum.head, rows: sum.body, widths: [38, 160, 110, 50, 42, 42, 42, 42, 48, 70, 70], align: ['l', 'l', 'l', 'c', 'c', 'c', 'c', 'c', 'c', 'c', 'c'] },
+      { type: 'table', heading: 'Harian', head: [mx.head[0], mx.head[1], ...att.days.map((d) => String(d.day)), ...sumCols],
+        rows: att.rows.map((r) => [r.emp.id, r.emp.name, ...r.cells.map((c) => fc(cellCode(c))), ...sumCols.map((k) => r.sums[k])]),
+        widths: [34, 108, ...att.days.map(() => 13.2), ...sumCols.map(() => 17)], align: ['l', 'l', ...att.days.map(() => 'c'), ...sumCols.map(() => 'c')] },
+      ...(dt.body.length ? [{ type: 'table', heading: 'Rincian pengajuan disetujui', head: dt.head, rows: dt.body, widths: [34, 105, 80, 140, 26, 54, 54, 36, 130, 90] }] : []),
+    ],
+  });
+  downloadBytes(`absensi-${fileMonth()}.pdf`, bytes, 'application/pdf');
+  toast('File PDF diunduh.', 'ok');
+}
+
+// ---------- Karyawan baru (diajukan, disetujui, lalu akun dibuat Kepala HRD) ----------
+const EMPREQ_LABEL = { pending_head: 'Menunggu Kepala HRD', pending_director: 'Menunggu Direktur', approved: 'Disetujui, akun belum dibuat', rejected: 'Ditolak', created: 'Akun sudah dibuat' };
+const empReqBadge = (s) => `<span class="badge ${s === 'created' || s === 'approved' ? 'b-ok' : s === 'rejected' ? 'b-no' : 'b-pending'}">${esc(EMPREQ_LABEL[s] || s)}</span>`;
+const NEWEMP_ROLES = ['staff_hrd', 'kepala_hrd', 'direktur'];
+const empReqAction = (u, r) => {
+  if (!C.inAccess(u, r.companyId, state.companies)) return null;
+  if (r.status === 'pending_head' && u.role === 'kepala_hrd' && r.requestedByUid !== u.uid) return 'head';
+  if (r.status === 'pending_director' && u.role === 'direktur') return 'director';
+  return null;
+};
+const canCreateFrom = (u, r) => r.status === 'approved' && u.role === 'kepala_hrd' && C.inAccess(u, r.companyId, state.companies);
+
+function empReqRow(r) {
+  const u = state.user, act = empReqAction(u, r);
+  return `<div class="q-item"><div class="q-main"><div class="who">${esc(r.name)} <span class="badge b-role">${esc(roleLabel(r.role))}</span> ${empReqBadge(r.status)}</div>
+    <div class="meta">Username <code>${esc(r.username)}</code> · PT ${esc(coName(r.companyId))} · bergabung ${esc(fd(r.joinDate))}</div>
+    <div class="meta">Diajukan ${esc(r.requestedBy)} (${esc(roleLabel(r.requestedByRole))}) · ${esc(fdt(r.requestedAt))}${r.decidedBy ? ` · diputuskan ${esc(r.decidedBy)}` : ''}</div>
+    ${r.rejectNote ? `<div class="meta">Alasan ditolak: ${esc(r.rejectNote)}</div>` : ''}${r.employeeId ? `<div class="meta">ID karyawan ${esc(r.employeeId)}</div>` : ''}</div>
+    <div class="q-act">${act ? `<button class="btn btn-ok btn-sm" data-act="er-decide" data-yes="1" data-id="${esc(r.id)}">Setujui</button><button class="btn btn-line btn-sm" data-act="er-decide" data-yes="0" data-id="${esc(r.id)}">Tolak</button>` : ''}
+    ${canCreateFrom(u, r) ? `<button class="btn btn-primary btn-sm" data-act="er-create" data-id="${esc(r.id)}">Buat akun</button>` : ''}</div></div>`;
+}
+
+pages.newemp = async () => {
+  const u = state.user;
+  if (!NEWEMP_ROLES.includes(u.role)) return pageHead('Karyawan Baru') + banner('warn', 'Menu ini tidak tersedia untuk role Anda.');
+  const list = (await listAll('employeeRequests')).slice().sort(byDateDesc('requestedAt'));
+  const mineAct = list.filter((r) => empReqAction(u, r)), ready = list.filter((r) => canCreateFrom(u, r));
+  const rest = list.filter((r) => !mineAct.includes(r) && !ready.includes(r));
+  const canAsk = u.role === 'staff_hrd' || u.role === 'kepala_hrd';
+  const sub = u.role === 'staff_hrd' ? 'Pengajuan Anda disetujui Kepala HRD, lalu Kepala HRD membuat akunnya.'
+    : u.role === 'kepala_hrd' ? 'Persetujuan pengajuan Staff HRD ada di sini. Pengajuan Anda sendiri disetujui Direktur. Setelah disetujui, Anda membuat akunnya.' : 'Setujui penambahan karyawan yang diajukan Kepala HRD.';
+  let h = pageHead('Karyawan Baru', sub, canAsk ? '<button class="btn btn-primary" data-act="er-add">Ajukan karyawan baru</button>' : '');
+  if (mineAct.length || u.role !== 'staff_hrd') h += card(`Menunggu persetujuan Anda (${mineAct.length})`, mineAct.length ? mineAct.map(empReqRow).join('') : emptyHtml('Tidak ada yang menunggu'));
+  if (u.role === 'kepala_hrd') h += card(`Siap dibuatkan akun (${ready.length})`, ready.length ? ready.map(empReqRow).join('') : emptyHtml('Belum ada', 'Pengajuan yang sudah disetujui akan muncul di sini.'));
+  h += card('Semua pengajuan', rest.length ? rest.map(empReqRow).join('') : emptyHtml('Belum ada pengajuan'));
+  return h;
+};
+
+async function empReqForm() {
+  const u = state.user;
+  const cos = state.companies.filter((c) => c.active !== false && access().includes(c.id));
+  if (!cos.length) return info('Belum ada PT', '<p>Anda belum punya akses PT aktif.</p>');
+  const coField = cos.length > 1
+    ? `<div class="field"><label for="erCo">Letakkan karyawan di PT</label><select id="erCo">${cos.map((c) => `<option value="${esc(c.id)}"${state.scope === c.id ? ' selected' : ''}>${esc(c.name)}</option>`).join('')}</select></div>`
+    : `<div class="field"><label>PT</label><div class="static">${esc(cos[0].name)}</div><input type="hidden" id="erCo" value="${esc(cos[0].id)}"></div>`;
+  const v = await dialog({
+    title: 'Ajukan karyawan baru',
+    body: `<div class="field"><label for="erName">Nama lengkap</label><input type="text" id="erName"></div>
+      <div class="field"><label for="erUser">Username</label><input type="text" id="erUser" autocapitalize="none"></div>
+      ${coField}
+      <div class="row2"><div class="field"><label for="erRole">Role</label><select id="erRole">${L.HRD_CREATABLE_ROLES.map((r) => `<option value="${r}">${esc(roleLabel(r))}</option>`).join('')}</select></div>
+      <div class="field"><label for="erJoin">Tanggal bergabung</label><input type="date" id="erJoin"></div></div>
+      <div class="hint">${u.role === 'kepala_hrd' ? 'Pengajuan ini akan disetujui Direktur.' : 'Pengajuan ini akan disetujui Kepala HRD.'} Akun dibuat Kepala HRD setelah disetujui.</div>`,
+    okLabel: 'Kirim pengajuan',
+    validate: () => {
+      if (!$('#erName').value.trim()) return 'Isi nama lengkap.';
+      const ue = L.validateUsername(L.normalizeUsername($('#erUser').value)); if (ue) return ue;
+      if (!$('#erCo').value) return 'Pilih PT.';
+      if (!L.parseDate($('#erJoin').value)) return 'Isi tanggal bergabung.';
+      return '';
+    },
+    getValue: () => ({ name: $('#erName').value.trim(), username: L.normalizeUsername($('#erUser').value), companyId: $('#erCo').value, role: $('#erRole').value, joinDate: $('#erJoin').value }),
+    onSubmit: async (d) => {
+      if (!access().includes(d.companyId)) throw new Error('PT di luar akses Anda.');
+      if ((await F.getDoc(F.doc(db, 'usernames', d.username))).exists()) throw new Error('Username sudah dipakai.');
+      bust();
+      if ((await listAll('employeeRequests')).some((r) => r.username === d.username && ['pending_head', 'pending_director', 'approved'].includes(r.status))) throw new Error('Username ini sudah ada di pengajuan lain.');
+      await F.addDoc(F.collection(db, 'employeeRequests'), { ...d, status: u.role === 'kepala_hrd' ? 'pending_director' : 'pending_head', requestedBy: u.name, requestedByUid: u.uid, requestedByRole: u.role, requestedAt: new Date().toISOString() });
+      bust();
+    },
+  });
+  if (v) { toast('Pengajuan terkirim.', 'ok'); go('newemp'); }
+}
+
+async function decideEmpReq(el) {
+  const id = el.dataset.id, approve = el.dataset.yes === '1', u = state.user;
+  let note = '';
+  if (!approve) {
+    const n = await dialog({ title: 'Tolak pengajuan karyawan', body: '<div class="field"><label for="erNote">Alasan penolakan</label><textarea id="erNote" maxlength="300"></textarea></div>', okLabel: 'Tolak', danger: true,
+      validate: () => ($('#erNote').value.trim() ? '' : 'Isi alasan penolakan.'), getValue: () => $('#erNote').value.trim() });
+    if (n === null) return; note = n;
+  } else if (!(await confirmBox('Setujui karyawan baru?', 'Setelah disetujui, Kepala HRD dapat membuat akunnya.', 'Setujui'))) return;
+  const ref = F.doc(db, 'employeeRequests', id);
+  await F.runTransaction(db, async (tx) => {
+    const s = await tx.get(ref);
+    if (!s.exists()) throw new Error('Pengajuan tidak ditemukan.');
+    const r = { id, ...s.data() };
+    if (!empReqAction(u, r)) throw new Error('Pengajuan ini sudah diproses atau bukan wewenang Anda.');
+    const who = { decidedBy: u.name, decidedByUid: u.uid, decidedByRole: u.role, decidedAt: new Date().toISOString() };
+    tx.update(ref, approve ? { status: 'approved', ...who } : { status: 'rejected', rejectNote: note, ...who });
+  });
+  bust(); toast(approve ? 'Disetujui.' : 'Ditolak.', 'ok'); go('newemp'); updateCounts();
+}
+
+async function createFromEmpReq(id) {
+  const u = state.user;
+  const r = (await listAll('employeeRequests')).find((x) => x.id === id);
+  if (!r || !canCreateFrom(u, r)) return toast('Pengajuan ini tidak bisa dibuatkan akun.', 'err');
+  const pw = randomPassword();
+  const v = await dialog({
+    title: `Buat akun - ${r.name}`,
+    body: `<p style="margin-bottom:12px">Username <code>${esc(r.username)}</code> · ${esc(roleLabel(r.role))} · ${esc(coName(r.companyId))}</p>
+      <div class="field"><label for="erPass">Password awal</label><input type="text" id="erPass" value="${pw}"><div class="hint">Berikan ke karyawan, lalu sarankan segera menggantinya di menu Profil. Password tidak disimpan di pengajuan.</div></div>`,
+    okLabel: 'Buat akun',
+    validate: () => ($('#erPass').value.length < 6 ? 'Password minimal 6 karakter.' : ''),
+    getValue: () => $('#erPass').value,
+    onSubmit: (password) => createAccount({ name: r.name, username: r.username, role: r.role, joinDate: r.joinDate, password, companyId: r.companyId, companyIds: [r.companyId], employeeRequestId: r.id }),
+  });
+  if (v) { await info('Akun dibuat', `<p>Catat dan berikan kepada karyawan:</p><p style="margin-top:10px">Username: <code>${esc(r.username)}</code><br>Password: <code>${esc(v)}</code><br>PT: <b>${esc(coName(r.companyId))}</b></p>`); bust(); go('newemp'); updateCounts(); }
 }
 
 // ---------- Event ----------
@@ -1210,15 +1596,20 @@ const acts = {
     await loadCompanies(); renderScope(); go('companies');
   },
   'acc-access': (el) => accessForm(el.dataset.uid),
-  'cal-nav': (el) => { const c = state.cal, d = new Date(c.y, c.m + parseInt(el.dataset.d, 10), 1); c.y = d.getFullYear(); c.m = d.getMonth(); refreshCal(); },
-  'cal-pick': (el) => {
-    const d = el.dataset.d, s0 = state.cal.sel;
-    if (!s0 || s0.a !== s0.b) state.cal.sel = { a: d, b: d };
-    else { const [a, b] = C.orderRange(s0.a, d); state.cal.sel = { a, b }; }
-    refreshCal();
-  },
-  'cal-clear': () => { state.cal.sel = null; refreshCal(); },
+  'cal-nav': (el) => { const c = state.cal, d = new Date(c.y, c.m + parseInt(el.dataset.d, 10), 1); c.y = d.getFullYear(); c.m = d.getMonth(); go('holidays'); },
+  'hol-add': addHolidayItem,
+  'hol-del': (el) => { const ym = ymStr(); state.cal.drafts[ym] = W.removeFromDraft(draftFor(ym), parseInt(el.dataset.i, 10)); go('holidays'); },
+  'hol-reset': () => { delete state.cal.drafts[ymStr()]; go('holidays'); },
+  'hol-submit': submitHolidayBatch,
   'hol-decide': holDecide,
+  'att-xlsx': exportAttendanceXlsx,
+  'att-pdf': exportAttendancePdf,
+  'att-view': (el) => viewAttachments(el.dataset.id),
+  'lv-photo': () => { $('#lvPhotoInput').click(); },
+  'lv-photo-del': (el) => { state.photos.splice(parseInt(el.dataset.i, 10), 1); renderPhotos(); updateCalc(); },
+  'er-add': empReqForm,
+  'er-decide': decideEmpReq,
+  'er-create': (el) => createFromEmpReq(el.dataset.id),
   logout: () => F.signOut(auth),
   'm-ok': dialogOk,
   'm-cancel': dialogCancel,
@@ -1227,8 +1618,7 @@ const acts = {
   'export-requests': exportRequests,
   'export-ledger': exportLedger,
   'adj-open': (el) => openAdjust(el.dataset.id),
-  'add-staff': async () => { if (await accountForm({ roles: L.HRD_CREATABLE_ROLES, title: 'Tambah karyawan' })) reload(); },
-  'acc-add': async () => { if (await accountForm({ roles: Object.keys(L.ROLES).filter((r) => r !== 'superuser'), title: 'Tambah akun' })) reload(); },
+  'acc-add': async () => { if (await accountForm({ roles: ['superuser', ...Object.keys(L.ROLES).filter((r) => r !== 'superuser')], title: 'Tambah akun' })) reload(); },
   'emp-detail': (el) => empDetail(el.dataset.id),
   'emp-role': (el) => changeRole(el.dataset.id),
   'emp-del': (el) => deleteEmployee(el.dataset.id),
@@ -1244,9 +1634,12 @@ const acts = {
   'photo-pick': () => { $('#photoInput').value = ''; $('#photoInput').click(); },
   'photo-remove': async () => { try { await setPhoto(''); toast('Foto dihapus.', 'ok'); } catch (e) { toast(errMsg(e), 'err'); } },
 };
-const submits = { login: doLogin, setup: doSetup, leave: submitLeave, settings: saveSettings, password: changePassword, holiday: proposeHoliday };
+const submits = { login: doLogin, setup: doSetup, leave: submitLeave, settings: saveSettings, password: changePassword };
 const inputs = {
   calc: updateCalc,
+  'lv-photo-file': addPhotos,
+  'att-month': (el) => { state.attMonth = el.value; go('attendance'); },
+  'ac-role': (el) => { const sup = el.value === 'superuser'; $('#acStd').hidden = sup; $('#acSuperHint').hidden = !sup; },
   scope: (el) => { state.scope = el.value; go(state.route); updateCounts(); },
   search: (el) => {
     const k = el.value.toLowerCase().trim(); let n = 0;
